@@ -34,8 +34,10 @@ PDFs/*
 # Local templates (keep folder, ignore PDFs)
 Templates/*
 !Templates/.gitkeep
+!Templates/CERTIDAO_CM/
+!Templates/CERTIDAO_CM/library_operpdf/
+!Templates/CERTIDAO_CM/library_operpdf/2018198741_p021-022.pdf
 
 # Local config
 configs/run.env
-configs/templates.json
 configs/template_library_meta.json

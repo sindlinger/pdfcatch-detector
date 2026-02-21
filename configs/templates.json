@@ -1,0 +1,22 @@
+{
+  "templates": [
+    {
+      "id": "tpl_despacho_p0",
+      "label": "DESPACHO",
+      "pdf": "Models/despacho_p1-2.pdf",
+      "page_index": 0
+    },
+    {
+      "id": "tpl_despacho_p1",
+      "label": "DESPACHO",
+      "pdf": "Models/despacho_p1-2.pdf",
+      "page_index": 1
+    },
+    {
+      "id": "tpl_certidao_cm_p0",
+      "label": "CERTIDAO_CM",
+      "pdf": "Templates/CERTIDAO_CM/library_operpdf/2018198741_p021-022.pdf",
+      "page_index": 0
+    }
+  ]
+}
