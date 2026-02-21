@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual envs
+.venv/
+venv/
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Project outputs
+outputs/
+Output/
+docs_extracted*/
+docs_extracted_*/
+*.tmp.json
+*.tmp.log
+
+# Local inputs (keep folder, ignore PDFs)
+PDFs/*
+!PDFs/.gitkeep
+
+# Local templates (keep folder, ignore PDFs)
+Templates/*
+!Templates/.gitkeep
+
+# Local config
+configs/run.env
+configs/templates.json
+configs/template_library_meta.json

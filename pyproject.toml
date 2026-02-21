@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdfcatch-detector"
+version = "0.1.0"
+description = "Offline PDF document detection by similarity (bytes/tlsh/stream/text/image), deterministic, no LLM."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "pymupdf>=1.23.0",
+  "pikepdf>=9.0.0",
+  "python-dotenv>=1.0.0",
+  "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+]
+prefilter = [
+  "py-tlsh>=4.5.0",
+]
+
+[project.scripts]
+cli = "pdfcatch.cli:main"
+pdfcatch-detector = "pdfcatch.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-s"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
