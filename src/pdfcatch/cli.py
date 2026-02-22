@@ -2334,7 +2334,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help=(
-            "Spec(s) de treino para bytes_ref_mode=mean2 (ex.: :D, /dir/despachos). "
+            "Spec(s) de treino para bytes_ref_mode=kmeans|mean2 (ex.: :D, /dir/despachos). "
             "Se vazio, usa PDFCATCH_BYTES_TRAIN_SPEC; se vazio, usa as specs do proprio lote."
         ),
     )
@@ -2835,6 +2835,8 @@ def main(argv: list[str] | None = None) -> int:
         selected_methods = list(methods)
         kmeans_ref_by_label: dict[str, dict[str, Any]] = {}
         mean2_ref_by_label: dict[str, dict[str, Any]] = {}
+        train_specs_cli = [str(x).strip() for x in (getattr(args, "bytes_train_spec", []) or []) if str(x).strip()]
+        train_specs_env = _split_env_terms(str(os.getenv("PDFCATCH_BYTES_TRAIN_SPEC") or ""))
         if bytes_ref_mode == "kmeans" and "bytes" in selected_methods:
             for _lab, _specs in [("DESPACHO", despacho_specs), ("CERTIDAO_CM", cert_specs)]:
                 if not _specs:
@@ -2845,9 +2847,13 @@ def main(argv: list[str] | None = None) -> int:
                     return 2
                 _tpls_seq = sorted(_tpls, key=lambda t: int(t.page_index))
                 _slot_templates = _group_templates_by_slot(_tpls_seq)
-                _train_pdfs = _expand_specs_unique(_specs)
+                _train_specs = list(train_specs_cli or train_specs_env or _specs)
+                _train_pdfs = _expand_specs_unique(_train_specs)
                 if not _train_pdfs:
-                    console.print(f"[red]error:[/red] no train PDFs for label={_lab} (required by kmeans mode)")
+                    console.print(
+                        f"[red]error:[/red] no train PDFs for label={_lab} in kmeans mode "
+                        f"(train_specs={_train_specs})"
+                    )
                     return 2
                 try:
                     _km_ref = _build_kmeans_bytes_reference(
@@ -2869,8 +2875,6 @@ def main(argv: list[str] | None = None) -> int:
                     style="bright_black",
                 )
         if bytes_ref_mode == "mean2" and "bytes" in selected_methods:
-            train_specs_cli = [str(x).strip() for x in (getattr(args, "bytes_train_spec", []) or []) if str(x).strip()]
-            train_specs_env = _split_env_terms(str(os.getenv("PDFCATCH_BYTES_TRAIN_SPEC") or ""))
             for _lab, _specs in [("DESPACHO", despacho_specs), ("CERTIDAO_CM", cert_specs)]:
                 if not _specs:
                     continue
