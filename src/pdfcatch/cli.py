@@ -59,15 +59,72 @@ _SAVE_KW = dict(
 _CMD_BLUE = "#4A90E2"
 _DIM = "#7f8c8d"
 _APP_NAME = "pdfcatch"
-_ALL_METHODS = ["bytes", "tlsh", "stream", "text", "image"]
-_METHOD_COLORS = {
-    "bytes": "#5f6f7f",
-    "tlsh": "#6a6f7a",
-    "stream": "#5f7a6f",
-    "text": "#b87838",
-    "image": "#75657a",
-}
-_KMEANS_FEATURE_FIELDS = ["log_p1", "log_p2", "log_total", "ratio_p2_p1", "spread_max_min"]
+_KMEANS_FEATURE_FIELDS = [
+    "log_p1",
+    "log_p2",
+    "log_total",
+    "ratio_p2_p1",
+    "spread_max_min",
+    "share_p1",
+    "log_ratio_p1_p2",
+]
+_TRACE_LOG_PATH: Path | None = None
+_TRACE_STEP: int = 0
+
+
+def _trace_set_path(path: Path | None) -> None:
+    global _TRACE_LOG_PATH, _TRACE_STEP
+    _TRACE_LOG_PATH = path
+    _TRACE_STEP = 0
+    if _TRACE_LOG_PATH is not None:
+        _TRACE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _trace_slim(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 2:
+        return str(value)[:200]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        cnt = 0
+        for k, v in value.items():
+            out[str(k)] = _trace_slim(v, depth=depth + 1)
+            cnt += 1
+            if cnt >= 20:
+                out["__truncated__"] = True
+                break
+        return out
+    if isinstance(value, (list, tuple, set)):
+        seq = list(value)
+        out = [_trace_slim(v, depth=depth + 1) for v in seq[:20]]
+        if len(seq) > 20:
+            out.append("__truncated__")
+        return out
+    return str(value)
+
+
+def _trace(step: str, **data: Any) -> None:
+    global _TRACE_STEP
+    if _TRACE_LOG_PATH is None:
+        return
+    _TRACE_STEP += 1
+    rec = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "step_no": int(_TRACE_STEP),
+        "step": str(step),
+        "data": _trace_slim(data),
+    }
+    line = json.dumps(rec, ensure_ascii=False)
+    try:
+        with _TRACE_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        # tracing must never break runtime
+        pass
+    print(f"[TRACE {int(_TRACE_STEP):04d}] {step} | {rec['data']}")
 
 
 def _app_version() -> str:
@@ -99,9 +156,9 @@ def _print_cli_help(console: Console, *, topic: str | None = None) -> None:
 
     if topic_norm in {"doc", "document"}:
         console.print("\n[bold]Uso rapido: doc[/bold]")
-        console.print(f"[{_CMD_BLUE}]cli doc -d :Q4-10 -m all --save-files outputs --web[/]")
-        console.print(f"[{_CMD_BLUE}]cli doc -c :Q1-20 -m bytes --top-n 10[/]")
-        console.print(f"[{_CMD_BLUE}]cli doc -d :Q8-8 -m bytes --top-n 1 --return[/]")
+        console.print(f"[{_CMD_BLUE}]cli doc -d :Q4-10 --save-files outputs --web[/]")
+        console.print(f"[{_CMD_BLUE}]cli doc -c :Q1-20 --top-n 10[/]")
+        console.print(f"[{_CMD_BLUE}]cli doc -d :Q8-8 --top-n 1 --return[/]")
     elif topic_norm in {"extract-text", "alt-extract", "extract"}:
         console.print("\n[bold]Uso rapido: extract-text[/bold]")
         console.print(f"[{_CMD_BLUE}]cli extract-text --pdf :Q8-8 --anchors configs/anchor_text_fields.example.json[/]")
@@ -125,8 +182,8 @@ def _print_cli_help(console: Console, *, topic: str | None = None) -> None:
         examples = textwrap.dedent(
             f"""
             [{_CMD_BLUE}]cli studio --pdfs :Q4-10[/]
-            [{_CMD_BLUE}]cli doc -d :Q4-10 -m all --save-files outputs --web[/]
-            [{_CMD_BLUE}]cli doc -c :Q3-8 -m bytes --top-n 5[/]
+            [{_CMD_BLUE}]cli doc -d :Q4-10 --save-files outputs --web[/]
+            [{_CMD_BLUE}]cli doc -c :Q3-8 --top-n 5[/]
             [{_CMD_BLUE}]cli tui[/]
             [{_CMD_BLUE}]cli help studio[/]
             """
@@ -376,7 +433,34 @@ def _load_templates(root: Path, path: Path) -> list[TemplateRef]:
         if not pdf_raw:
             raise ValueError(f"template[{i}]: missing 'pdf'")
         pdf_path = _resolve(root, str(pdf_raw))
-        page_index = int(it.get("page_index") or 0)
+        if not pdf_path.exists() or not pdf_path.is_file():
+            raise ValueError(f"template[{i}]: pdf not found: {pdf_path}")
+
+        if "page_index" not in it:
+            raise ValueError(f"template[{i}]: missing required 'page_index' (silent default is forbidden)")
+        try:
+            page_index = int(it.get("page_index"))
+        except Exception as exc:
+            raise ValueError(f"template[{i}]: invalid 'page_index': {it.get('page_index')!r}") from exc
+        if page_index < 0:
+            raise ValueError(f"template[{i}]: invalid 'page_index' (must be >=0): {page_index}")
+
+        try:
+            doc = fitz.open(str(pdf_path))
+            try:
+                page_count = int(doc.page_count)
+            finally:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            raise ValueError(f"template[{i}]: cannot open pdf: {pdf_path}") from exc
+        if page_index >= page_count:
+            raise ValueError(
+                f"template[{i}]: page_index out of range for {pdf_path.name}: "
+                f"page_index={page_index} page_count={page_count}"
+            )
         out.append(TemplateRef(id=tid, label=label, pdf_path=str(pdf_path), page_index=page_index))
     return out
 
@@ -472,6 +556,108 @@ class SlotSizeModel:
     mad_size: float
     sample_count: int
 
+def _coerce_slot_size_models(raw: Any, *, where: str) -> list[SlotSizeModel]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"{where}: missing slot_size_models")
+    out: list[SlotSizeModel] = []
+    for i, it in enumerate(raw):
+        if isinstance(it, SlotSizeModel):
+            out.append(it)
+            continue
+        if not isinstance(it, dict):
+            raise ValueError(f"{where}: slot_size_models[{i}] must be object")
+        try:
+            out.append(
+                SlotSizeModel(
+                    slot=int(it.get("slot")),
+                    template_page_index=int(it.get("template_page_index")),
+                    model_size=int(it.get("model_size")),
+                    median_size=float(it.get("median_size")),
+                    mad_size=float(it.get("mad_size")),
+                    sample_count=int(it.get("sample_count")),
+                )
+            )
+        except Exception as exc:
+            raise ValueError(f"{where}: invalid slot_size_models[{i}]") from exc
+    return out
+
+
+def _normalize_kmeans_reference_payload(raw: dict[str, Any], *, where: str) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where}: reference must be object")
+    slot_models = _coerce_slot_size_models(raw.get("slot_size_models"), where=where)
+    km_model = raw.get("kmeans_model")
+    if not isinstance(km_model, dict):
+        raise ValueError(f"{where}: missing kmeans_model")
+    feature_fields = km_model.get("feature_fields")
+    if not isinstance(feature_fields, list) or [str(x) for x in feature_fields] != list(_KMEANS_FEATURE_FIELDS):
+        raise ValueError(
+            f"{where}: invalid feature_fields; expected exactly {_KMEANS_FEATURE_FIELDS}"
+        )
+    centroids = km_model.get("centroids")
+    if not isinstance(centroids, list) or not centroids:
+        raise ValueError(f"{where}: missing centroids")
+    _ = int(km_model.get("target_cluster"))
+    return {
+        "slot_size_models": slot_models,
+        "kmeans_model": km_model,
+        "summary": raw.get("summary") if isinstance(raw.get("summary"), dict) else {},
+    }
+
+
+def _load_kmeans_reference_file(root: Path, ref_path: str) -> tuple[Path, dict[str, dict[str, Any]]]:
+    path = _resolve(root, str(ref_path))
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"kmeans reference file not found: {path}")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    refs = raw.get("kmeans_reference_by_label")
+    if not isinstance(refs, dict) or not refs:
+        raise ValueError("invalid reference file: missing kmeans_reference_by_label")
+    out: dict[str, dict[str, Any]] = {}
+    for label, ref in refs.items():
+        lab = str(label).strip()
+        if not lab:
+            continue
+        out[lab] = _normalize_kmeans_reference_payload(ref, where=f"{path.name}:{lab}")
+    if not out:
+        raise ValueError(f"reference file has no valid labels: {path}")
+    return (path.resolve(), out)
+
+
+def _load_latest_kmeans_reference_file(root: Path) -> tuple[Path | None, dict[str, dict[str, Any]]]:
+    ref_dir = _resolve(root, "io/out/reference")
+    if not ref_dir.exists() or not ref_dir.is_dir():
+        return (None, {})
+    cands = sorted(ref_dir.glob("kmeans_reference__*.json"))
+    if not cands:
+        return (None, {})
+    latest = cands[-1]
+    pth, refs = _load_kmeans_reference_file(root, str(latest))
+    return (pth, refs)
+
+
+def _print_cli_args_snapshot(args: argparse.Namespace) -> None:
+    vals = vars(args)
+    keys = sorted(vals.keys())
+    print("PARAMS:")
+    for k in keys:
+        v = vals.get(k)
+        if isinstance(v, bool):
+            print(f"  {k}: value={v} enabled={'true' if v else 'false'}")
+            continue
+        is_set = False
+        if v is None:
+            is_set = False
+        elif isinstance(v, str):
+            is_set = bool(v.strip())
+        elif isinstance(v, (list, tuple, set, dict)):
+            is_set = len(v) > 0
+        elif isinstance(v, (int, float)):
+            is_set = True
+        else:
+            is_set = bool(v)
+        print(f"  {k}: value={v!r} provided={'true' if is_set else 'false'}")
+
 
 def _page_indices_from_window(window: Any) -> list[int]:
     if not isinstance(window, dict):
@@ -529,96 +715,15 @@ def _window_to_idx_pages(window: Any) -> tuple[str, str]:
     return ("-", "-")
 
 
-def _method_pages_line(ps: dict[str, Any], *, colored: bool = False) -> str:
-    methods_map = ps.get("methods") if isinstance(ps.get("methods"), dict) else {}
-    selected = ps.get("selected_methods")
-    methods: list[str]
-    if isinstance(selected, list):
-        methods = [str(m).strip().lower() for m in selected if str(m).strip()]
-    else:
-        methods = [str(m).strip().lower() for m in methods_map.keys() if str(m).strip()]
-        methods = [m for m in _ALL_METHODS if m in methods] + [m for m in methods if m not in _ALL_METHODS]
-    if not methods:
-        return "-"
-
-    parts: list[str] = []
-    for m in methods:
-        md = methods_map.get(m) if isinstance(methods_map, dict) else None
-        bw = md.get("best_window") if isinstance(md, dict) else None
-        idx0, pages = _window_to_idx_pages(bw)
-        value = "-" if idx0 == "-" else f"idx{idx0}/p{pages}"
-        if colored:
-            c = _METHOD_COLORS.get(m, "white")
-            parts.append(f"[{c}]{m}[/{c}]={value}")
-        else:
-            parts.append(f"{m}={value}")
-    return ", ".join(parts) if parts else "-"
-
-
-def _method_short_name(method: str) -> str:
-    m = str(method or "").strip().lower()
-    return {
-        "bytes": "BYT",
-        "tlsh": "TLS",
-        "stream": "STR",
-        "text": "TXT",
-        "image": "IMG",
-    }.get(m, m[:3].upper() if m else "MTH")
-
-
-def _report_methods(rows: list[dict[str, Any]]) -> list[str]:
-    seen: list[str] = []
-    for ps in rows:
-        selected = ps.get("selected_methods")
-        if isinstance(selected, list):
-            for m in selected:
-                key = str(m).strip().lower()
-                if key and key not in seen:
-                    seen.append(key)
-    if not seen:
-        for ps in rows:
-            methods_map = ps.get("methods")
-            if isinstance(methods_map, dict):
-                for m in methods_map.keys():
-                    key = str(m).strip().lower()
-                    if key and key not in seen:
-                        seen.append(key)
-    return [m for m in _ALL_METHODS if m in seen] + [m for m in seen if m not in _ALL_METHODS]
-
-
-def _method_cell_compact(ps: dict[str, Any], method: str, *, colored: bool = False) -> str:
-    methods_map = ps.get("methods")
-    if not isinstance(methods_map, dict):
-        return "-"
-    md = methods_map.get(method)
-    if not isinstance(md, dict):
-        return "-"
-    if str(md.get("status") or "") != "ok":
-        return "-"
-    bw = md.get("best_window")
-    _idx, pages = _window_to_idx_pages(bw)
-    score = md.get("score")
-    if pages == "-" or not isinstance(score, (int, float)):
-        return "-"
-    text = f"p{pages}|{float(score):.3f}"
-    if not colored:
-        return text
-    c = _METHOD_COLORS.get(str(method).lower(), "white")
-    return f"[{c}]{text}[/{c}]"
-
-
-def _method_detail_tuple(ps: dict[str, Any], method: str) -> tuple[str, str, float | None]:
-    methods_map = ps.get("methods")
-    if not isinstance(methods_map, dict):
+def _bytes_kmeans_detail_tuple(ps: dict[str, Any]) -> tuple[str, str, float | None]:
+    bk = ps.get("bytes_kmeans")
+    if not isinstance(bk, dict):
         return ("-", "-", None)
-    md = methods_map.get(method)
-    if not isinstance(md, dict):
+    if str(bk.get("status") or "") != "ok":
         return ("-", "-", None)
-    if str(md.get("status") or "") != "ok":
-        return ("-", "-", None)
-    bw = md.get("best_window")
+    bw = bk.get("best_window")
     idx0, pages = _window_to_idx_pages(bw)
-    score = md.get("score")
+    score = bk.get("score")
     sc = float(score) if isinstance(score, (int, float)) else None
     return (idx0, pages, sc)
 
@@ -708,7 +813,6 @@ class LiveRunDashboard:
 def _print_consolidated_report(console: Console, process_summaries: list[dict[str, Any]]) -> None:
     if not process_summaries:
         return
-    methods = _report_methods(process_summaries)
     console.print("Relatorio final consolidado", style="bold white")
     summary_table = Table(
         box=None,
@@ -733,21 +837,18 @@ def _print_consolidated_report(console: Console, process_summaries: list[dict[st
         summary_table.add_row(str(ridx), cand, lab, final_txt, win_idx)
 
     console.print(summary_table)
-    if methods:
-        console.print("Detalhe por metodo", style="bold white")
-        for ridx, ps in enumerate(process_summaries, start=1):
-            cand = Path(str(ps.get("candidate_pdf") or "-")).name
-            fs = ps.get("final_score")
-            final_txt = f"{float(fs):.4f}" if isinstance(fs, (int, float)) else "-"
-            win_idx = str(ps.get("best_idx0") or "-")
-            console.print(f"{ridx:>2}. {cand} | final={final_txt} | idx0={win_idx}", style="bright_black")
-            for m in methods:
-                idx0, pages, sc = _method_detail_tuple(ps, m)
-                c = _METHOD_COLORS.get(str(m).lower(), "white")
-                if idx0 == "-" or sc is None:
-                    console.print(f"    [{c}]{_method_short_name(m)}[/{c}] -> -")
-                else:
-                    console.print(f"    [{c}]{_method_short_name(m)}[/{c}] -> idx{idx0}/p{pages} | {sc:.4f}")
+    console.print("Detalhe do pipeline", style="bold white")
+    for ridx, ps in enumerate(process_summaries, start=1):
+        cand = Path(str(ps.get("candidate_pdf") or "-")).name
+        fs = ps.get("final_score")
+        final_txt = f"{float(fs):.4f}" if isinstance(fs, (int, float)) else "-"
+        win_idx = str(ps.get("best_idx0") or "-")
+        console.print(f"{ridx:>2}. {cand} | final={final_txt} | idx0={win_idx}", style="bright_black")
+        idx0, pages, sc = _bytes_kmeans_detail_tuple(ps)
+        if idx0 == "-" or sc is None:
+            console.print("    Bytes+Kmeans -> -")
+        else:
+            console.print(f"    Bytes+Kmeans -> idx{idx0}/p{pages} | {sc:.4f}")
 
 
 def _rank_windows_by_size(
@@ -860,67 +961,6 @@ def _rank_windows_by_size(
             reverse=True,
         )
         return (ranked_ok, N, max(0, N - K + 1))
-    finally:
-        try:
-            cand.close()
-        except Exception:
-            pass
-
-
-def _rank_windows_by_mean2(
-    *,
-    candidate_pdf: Path,
-    mean_page_sizes: list[float],
-) -> tuple[list[BestWindow], int, int]:
-    K = int(len(mean_page_sizes))
-    if K <= 0:
-        return ([], 0, 0)
-    cand = fitz.open(str(candidate_pdf))
-    try:
-        N = int(cand.page_count)
-        if N < K:
-            return ([], N, 0)
-        cand_sizes = [int(len(_one_page_pdf_bytes(cand, page_index=i))) for i in range(N)]
-        ranked: list[BestWindow] = []
-        for start in range(0, N - K + 1):
-            per: list[dict[str, Any]] = []
-            dists: list[float] = []
-            for pos in range(K):
-                pi = int(start + pos)
-                csz = int(cand_sizes[pi])
-                mean_sz = float(mean_page_sizes[pos])
-                denom = max(1.0, float(abs(mean_sz)))
-                dist = float(abs(float(csz) - float(mean_sz)) / denom)
-                slot_score = float(1.0 / (1.0 + dist))
-                per.append(
-                    {
-                        "page_index": pi,
-                        "size_bytes": csz,
-                        "mean_size": float(mean_sz),
-                        "distance_norm": float(dist),
-                        "score": float(slot_score),
-                    }
-                )
-                dists.append(float(dist))
-            avg_dist = float(sum(dists) / float(len(dists) or 1))
-            total = float(1.0 / (1.0 + avg_dist))
-            ranked.append(
-                BestWindow(
-                    start_page=int(start),
-                    end_page=int(start + K - 1),
-                    total=float(total),
-                    per_page=per,
-                    meta={"mean_distance": float(avg_dist), "selection_rule": "nearest_mean_distance"},
-                )
-            )
-        ranked.sort(
-            key=lambda w: (
-                float(w.total),
-                -float((w.meta or {}).get("mean_distance") or 0.0),
-            ),
-            reverse=True,
-        )
-        return (ranked, N, max(0, N - K + 1))
     finally:
         try:
             cand.close()
@@ -1069,34 +1109,6 @@ def _load_kmeans_text_terms(root: Path) -> dict[str, Any]:
     }
 
 
-def _window_feature_from_sizes(sizes: list[int]) -> list[float]:
-    if len(sizes) < 2:
-        raise ValueError("kmeans bytes feature requires at least 2 page sizes")
-    p1 = max(1, int(sizes[0]))
-    p2 = max(1, int(sizes[1]))
-    total = max(1, int(sum(int(v) for v in sizes)))
-    mn = max(1, int(min(sizes)))
-    mx = max(1, int(max(sizes)))
-    return [
-        float(math.log1p(p1)),
-        float(math.log1p(p2)),
-        float(math.log1p(total)),
-        float(float(p2) / float(p1)),
-        float(float(mx) / float(mn)),
-    ]
-
-
-def _euclidean_distance(a: list[float], b: list[float]) -> float:
-    n = min(len(a), len(b))
-    if n <= 0:
-        return 0.0
-    acc = 0.0
-    for i in range(n):
-        d = float(a[i]) - float(b[i])
-        acc += (d * d)
-    return float(math.sqrt(acc))
-
-
 def _window_text_signal(
     *,
     folded_text: str,
@@ -1122,6 +1134,36 @@ def _window_text_signal(
         "tip_total": int(len(tip_terms_fold)),
         "tip_rate": float(float(tip_hits) / float(tip_total)),
     }
+def _window_feature_from_sizes(sizes: list[int]) -> list[float]:
+    if len(sizes) < 2:
+        raise ValueError("kmeans bytes feature requires at least 2 page sizes")
+    p1 = max(1, int(sizes[0]))
+    p2 = max(1, int(sizes[1]))
+    total = max(1, int(sum(int(v) for v in sizes)))
+    mn = max(1, int(min(sizes)))
+    mx = max(1, int(max(sizes)))
+    share_p1 = float(p1) / float(total)
+    log_ratio_p1_p2 = float(math.log1p(p1)) - float(math.log1p(p2))
+    return [
+        float(math.log1p(p1)),
+        float(math.log1p(p2)),
+        float(math.log1p(total)),
+        float(float(p2) / float(p1)),
+        float(float(mx) / float(mn)),
+        float(share_p1),
+        float(log_ratio_p1_p2),
+    ]
+
+
+def _euclidean_distance(a: list[float], b: list[float]) -> float:
+    n = min(len(a), len(b))
+    if n <= 0:
+        return 0.0
+    acc = 0.0
+    for i in range(n):
+        d = float(a[i]) - float(b[i])
+        acc += (d * d)
+    return float(math.sqrt(acc))
 
 
 def _build_kmeans_bytes_reference(
@@ -1131,6 +1173,12 @@ def _build_kmeans_bytes_reference(
     label: str,
     train_pdfs: list[Path],
 ) -> dict[str, Any]:
+    _trace(
+        "enter._build_kmeans_bytes_reference",
+        label=label,
+        train_pdf_count=len(train_pdfs),
+        slot_count=len(slot_templates),
+    )
     if _np is None or _SkKMeans is None:
         raise RuntimeError("bytes_ref_mode=kmeans requires numpy + scikit-learn installed")
     K = int(len(slot_templates))
@@ -1188,6 +1236,11 @@ def _build_kmeans_bytes_reference(
         raise ValueError(f"PDFCATCH_KMEANS_CLUSTERS must be 2 (got {n_clusters})")
 
     X = _np.array([row["feature"] for row in train_rows], dtype=float)
+    if len(X.shape) != 2 or int(X.shape[1]) != int(len(_KMEANS_FEATURE_FIELDS)):
+        raise RuntimeError(
+            "invalid kmeans train feature shape: "
+            f"got={tuple(X.shape)} expected=(*,{len(_KMEANS_FEATURE_FIELDS)})"
+        )
     km = _SkKMeans(n_clusters=n_clusters, random_state=42, n_init=10)
     labels = [int(v) for v in km.fit_predict(X).tolist()]
     centroids = [[float(x) for x in row] for row in km.cluster_centers_.tolist()]
@@ -1242,6 +1295,19 @@ def _build_kmeans_bytes_reference(
     if best_cluster is None:
         raise RuntimeError("kmeans failed to select target cluster")
 
+    target_cluster_initial = int(best_cluster)
+    min_target_count = int(os.getenv("PDFCATCH_KMEANS_MIN_TARGET_COUNT", "5") or "5")
+    if min_target_count < 1:
+        min_target_count = 1
+    target_count_initial = int(cluster_acc.get(int(target_cluster_initial), {}).get("count") or 0)
+    if target_count_initial < min_target_count:
+        best_cluster = int(
+            max(
+                cluster_acc.keys(),
+                key=lambda cid: int(cluster_acc.get(int(cid), {}).get("count") or 0),
+            )
+        )
+
     target_rows = [row for row, cid in zip(train_rows, labels) if int(cid) == int(best_cluster)]
     if not target_rows:
         raise RuntimeError("kmeans selected empty target cluster")
@@ -1276,10 +1342,20 @@ def _build_kmeans_bytes_reference(
         w_size = float(w_size / norm)
         w_cluster = float(w_cluster / norm)
 
-    return {
+    feat_mean = [float(v) for v in _np.mean(X, axis=0).tolist()]
+    feat_std = [float(v) for v in _np.std(X, axis=0).tolist()]
+    feat_min = [float(v) for v in _np.min(X, axis=0).tolist()]
+    feat_max = [float(v) for v in _np.max(X, axis=0).tolist()]
+
+    result = {
         "slot_size_models": slot_models,
         "kmeans_model": {
             "feature_fields": list(_KMEANS_FEATURE_FIELDS),
+            "feature_mean": feat_mean,
+            "feature_std": feat_std,
+            "feature_min": feat_min,
+            "feature_max": feat_max,
+            "feature_count": int(X.shape[0]),
             "centroids": centroids,
             "target_cluster": int(best_cluster),
             "target_centroid": [float(v) for v in centroids[int(best_cluster)]],
@@ -1290,7 +1366,10 @@ def _build_kmeans_bytes_reference(
             "train_pdf_count": int(len(train_pdfs)),
             "train_window_count": int(len(train_rows)),
             "target_cluster_rule": "max(required_all_rate, required_mean_rate, tip_mean_rate, count)",
+            "target_cluster_initial": int(target_cluster_initial),
             "target_cluster": int(best_cluster),
+            "target_cluster_min_count_guardrail": int(min_target_count),
+            "target_cluster_initial_count": int(target_count_initial),
             "cluster_summaries": cluster_summaries,
             "required_terms": required_terms,
             "tip_term_count": int(len(tip_terms)),
@@ -1300,182 +1379,14 @@ def _build_kmeans_bytes_reference(
             "centroids": centroids,
         },
     }
-
-
-def _build_mean2_bytes_reference(
-    *,
-    slot_templates: list[list[TemplateRef]],
-    label: str,
-    train_pdfs: list[Path],
-) -> dict[str, Any]:
-    K = int(len(slot_templates))
-    if K <= 0:
-        raise ValueError(f"bytes_ref_mode=mean2 invalid slot count for label={label}")
-
-    rows: list[list[int]] = []
-    skipped_short = 0
-    for pdf in train_pdfs:
-        doc = fitz.open(str(pdf))
-        try:
-            N = int(doc.page_count)
-            if N < K:
-                skipped_short += 1
-                continue
-            # mean2 assumes treino ja segmentado em docs-alvo; usa janela inicial fixa.
-            sz = [int(len(_one_page_pdf_bytes(doc, page_index=pos))) for pos in range(K)]
-            rows.append(sz)
-        finally:
-            try:
-                doc.close()
-            except Exception:
-                pass
-
-    if len(rows) < 2:
-        raise RuntimeError(
-            f"bytes_ref_mode=mean2 needs >=2 train docs for label={label}; got={len(rows)}"
-        )
-
-    z_thr = float(_env_float("PDFCATCH_MEAN2_OUTLIER_Z", 3.0))
-    pct_tol = float(_env_float("PDFCATCH_MEAN2_OUTLIER_PCT", 0.15))
-    if z_thr <= 0:
-        z_thr = 3.0
-    if pct_tol < 0:
-        pct_tol = 0.15
-
-    slot_stats: list[dict[str, Any]] = []
-    keep_masks: list[list[bool]] = []
-    for pos in range(K):
-        vals = [int(r[pos]) for r in rows]
-        med = _median_float(vals)
-        mad = _mad_float(vals, center=med)
-        sigma = float(1.4826 * mad)
-        mask: list[bool] = []
-        if sigma > 0.0:
-            lim = float(z_thr * sigma)
-        else:
-            lim = float(max(1.0, abs(med) * pct_tol))
-        for v in vals:
-            mask.append(bool(abs(float(v) - float(med)) <= float(lim)))
-        keep_masks.append(mask)
-        slot_stats.append(
-            {
-                "slot": int(pos + 1),
-                "median_raw": float(med),
-                "mad_raw": float(mad),
-                "sigma_raw": float(sigma),
-                "limit_abs": float(lim),
-            }
-        )
-
-    kept_rows: list[list[int]] = []
-    for ridx, r in enumerate(rows):
-        ok = True
-        for pos in range(K):
-            if not keep_masks[pos][ridx]:
-                ok = False
-                break
-        if ok:
-            kept_rows.append(r)
-
-    if len(kept_rows) < 2:
-        kept_rows = list(rows)
-
-    slot_size_models: list[SlotSizeModel] = []
-    mean_sizes: list[float] = []
-    std_sizes: list[float] = []
-    for pos in range(K):
-        vals = [int(r[pos]) for r in kept_rows]
-        cnt = len(vals)
-        m = float(sum(vals) / float(max(1, cnt)))
-        var = float(sum((float(v) - m) ** 2 for v in vals) / float(max(1, cnt)))
-        sd = float(math.sqrt(var))
-        med = _median_float(vals)
-        mad = _mad_float(vals, center=med)
-        rep = slot_templates[pos][0] if pos < len(slot_templates) and slot_templates[pos] else None
-        slot_size_models.append(
-            SlotSizeModel(
-                slot=int(pos + 1),
-                template_page_index=int(rep.page_index) if rep is not None else int(pos),
-                model_size=int(round(m)),
-                median_size=float(med),
-                mad_size=float(mad),
-                sample_count=int(cnt),
-            )
-        )
-        mean_sizes.append(float(m))
-        std_sizes.append(float(sd))
-
-    return {
-        "slot_size_models": slot_size_models,
-        "summary": {
-            "label": str(label),
-            "train_pdf_count": int(len(train_pdfs)),
-            "train_doc_count_used_raw": int(len(rows)),
-            "train_doc_count_used_kept": int(len(kept_rows)),
-            "skipped_short_docs": int(skipped_short),
-            "outlier_rule": {
-                "kind": "median_mad_per_slot",
-                "z_threshold": float(z_thr),
-                "pct_fallback_if_mad0": float(pct_tol),
-            },
-            "slot_stats": slot_stats,
-            "mean_sizes": mean_sizes,
-            "std_sizes": std_sizes,
-            "selection_rule": "nearest_contiguous_pair_by_normalized_mean_distance",
-        },
-    }
-
-
-def _build_slot_size_models(
-    *,
-    slot_templates: list[list[TemplateRef]],
-    bytes_ref_mode: str,
-) -> list[SlotSizeModel]:
-    mode = str(bytes_ref_mode).strip().lower()
-    if mode not in {"robust", "legacy"}:
-        raise ValueError(f"invalid bytes_ref_mode: {bytes_ref_mode!r} (expected: robust|legacy)")
-
-    out: list[SlotSizeModel] = []
-    tpl_docs: dict[str, fitz.Document] = {}
-    try:
-        for slot, grp in enumerate(slot_templates, start=1):
-            if not grp:
-                continue
-            sample_sizes: list[int] = []
-            for t in grp:
-                pdfp = str(Path(t.pdf_path).resolve())
-                if pdfp not in tpl_docs:
-                    tpl_docs[pdfp] = fitz.open(pdfp)
-                d = tpl_docs[pdfp]
-                sample_sizes.append(int(len(_one_page_pdf_bytes(d, page_index=int(t.page_index)))))
-
-            rep = grp[0]
-            if mode == "legacy":
-                model_size = int(sample_sizes[0]) if sample_sizes else 0
-                median_size = float(model_size)
-                mad_size = 0.0
-            else:
-                median_size = _median_float(sample_sizes)
-                mad_size = _mad_float(sample_sizes, center=median_size)
-                model_size = int(round(median_size)) if sample_sizes else 0
-
-            out.append(
-                SlotSizeModel(
-                    slot=int(slot),
-                    template_page_index=int(rep.page_index),
-                    model_size=int(model_size),
-                    median_size=float(median_size),
-                    mad_size=float(mad_size),
-                    sample_count=int(len(sample_sizes)),
-                )
-            )
-        return out
-    finally:
-        for d in tpl_docs.values():
-            try:
-                d.close()
-            except Exception:
-                pass
+    _trace(
+        "exit._build_kmeans_bytes_reference",
+        label=label,
+        train_window_count=len(train_rows),
+        target_cluster=result["kmeans_model"].get("target_cluster"),
+        slot_sample_counts=[int(sm.sample_count) for sm in slot_models],
+    )
+    return result
 
 
 def _run_doc_extract(
@@ -1489,9 +1400,8 @@ def _run_doc_extract(
     top_n: int = 5,
     min_p1: float | None = None,
     min_p2: float | None = None,
-    bytes_ref_mode: str = "robust",
+    bytes_ref_mode: str = "kmeans",
     kmeans_reference: dict[str, Any] | None = None,
-    mean2_reference: dict[str, Any] | None = None,
     emit_details: bool = True,
     candidate_position: tuple[int, int] | None = None,
     console: Console | None = None,
@@ -1586,28 +1496,29 @@ def _run_doc_extract(
 
     kmeans_model_ctx: dict[str, Any] | None = None
     kmeans_summary: dict[str, Any] | None = None
-    mean2_summary: dict[str, Any] | None = None
     bytes_mode_active = method in {"bytes", "byte", "size", "size_only"}
-    if bytes_mode_active and str(bytes_ref_mode).strip().lower() == "kmeans":
+    bytes_ref_mode = str(bytes_ref_mode).strip().lower() or "kmeans"
+    if bytes_mode_active and bytes_ref_mode != "kmeans":
+        raise ValueError("doc bytes mode uses only bytes_ref_mode=kmeans in this pipeline")
+    if bytes_mode_active:
         if not isinstance(kmeans_reference, dict):
             raise ValueError("bytes_ref_mode=kmeans requires explicit kmeans_reference (no implicit fallback)")
-        slot_size_models = list(kmeans_reference.get("slot_size_models") or [])
+        slot_size_models = _coerce_slot_size_models(
+            kmeans_reference.get("slot_size_models"),
+            where=f"kmeans_reference:{label}",
+        )
         kmeans_model_ctx = kmeans_reference.get("kmeans_model") if isinstance(kmeans_reference.get("kmeans_model"), dict) else None
         kmeans_summary = kmeans_reference.get("summary") if isinstance(kmeans_reference.get("summary"), dict) else None
         if not slot_size_models or kmeans_model_ctx is None:
             raise ValueError("invalid kmeans_reference payload (missing slot_size_models/kmeans_model)")
-    elif bytes_mode_active and str(bytes_ref_mode).strip().lower() == "mean2":
-        if not isinstance(mean2_reference, dict):
-            raise ValueError("bytes_ref_mode=mean2 requires explicit mean2_reference (no implicit fallback)")
-        slot_size_models = list(mean2_reference.get("slot_size_models") or [])
-        mean2_summary = mean2_reference.get("summary") if isinstance(mean2_reference.get("summary"), dict) else None
-        if not slot_size_models:
-            raise ValueError("invalid mean2_reference payload (missing slot_size_models)")
+        kf = kmeans_model_ctx.get("feature_fields")
+        if not isinstance(kf, list) or [str(x) for x in kf] != list(_KMEANS_FEATURE_FIELDS):
+            raise ValueError(
+                "invalid kmeans_reference payload (feature_fields mismatch); "
+                f"expected={_KMEANS_FEATURE_FIELDS}"
+            )
     else:
-        fallback_mode = str(bytes_ref_mode).strip().lower()
-        if fallback_mode not in {"robust", "legacy"}:
-            fallback_mode = "robust"
-        slot_size_models = _build_slot_size_models(slot_templates=slot_templates, bytes_ref_mode=fallback_mode)
+        slot_size_models = []
     model_sizes = [int(sm.model_size) for sm in slot_size_models]
     if len(model_sizes) != K:
         raise ValueError(
@@ -1738,7 +1649,7 @@ def _run_doc_extract(
                 else:
                     slot_rules.append(f"p{pos+1}>={bytes_min_any:.2f}")
             _p(f"bytes_ref_mode: {bytes_ref_mode}")
-            if str(bytes_ref_mode).strip().lower() == "kmeans" and isinstance(kmeans_summary, dict):
+            if isinstance(kmeans_summary, dict):
                 _p(
                     "kmeans_target: "
                     f"cluster={kmeans_summary.get('target_cluster')} "
@@ -1748,17 +1659,7 @@ def _run_doc_extract(
                 _p(f"kmeans_rule: {kmeans_summary.get('target_cluster_rule')}")
                 if kmeans_summary.get("anchor_source"):
                     _p(f"kmeans_anchor_source: {kmeans_summary.get('anchor_source')}")
-            if str(bytes_ref_mode).strip().lower() == "mean2" and isinstance(mean2_summary, dict):
-                _p(
-                    "mean2_ref: "
-                    f"train_raw={mean2_summary.get('train_doc_count_used_raw')} "
-                    f"| kept={mean2_summary.get('train_doc_count_used_kept')}"
-                )
-                _p(f"mean2_rule: {mean2_summary.get('selection_rule')}")
-            if str(bytes_ref_mode).strip().lower() == "mean2":
-                _p("min_scores: (off in mean2 mode; nearest distance only)")
-            else:
-                _p(f"min_scores: any>={bytes_min_any:.2f} | " + " | ".join(slot_rules))
+            _p(f"min_scores: any>={bytes_min_any:.2f} | " + " | ".join(slot_rules))
         if method == "tlsh" and model_win_tlsh:
             _p(
                 f"janela_modelo: size_bytes={int(model_win_size or 0)} "
@@ -1775,19 +1676,13 @@ def _run_doc_extract(
         window_count: int | None = None
 
         if method in {"bytes", "byte", "size", "size_only"}:
-            if str(bytes_ref_mode).strip().lower() == "mean2":
-                ranked_windows, candidate_page_count, window_count = _rank_windows_by_mean2(
-                    candidate_pdf=cand_pdf,
-                    mean_page_sizes=[float(v) for v in model_sizes],
-                )
-            else:
-                ranked_windows, candidate_page_count, window_count = _rank_windows_by_size(
-                    candidate_pdf=cand_pdf,
-                    model_page_sizes=model_sizes,
-                    min_p1_override=bytes_min_p1,
-                    min_p2_override=bytes_min_p2,
-                    kmeans_ctx=kmeans_model_ctx,
-                )
+            ranked_windows, candidate_page_count, window_count = _rank_windows_by_size(
+                candidate_pdf=cand_pdf,
+                model_page_sizes=model_sizes,
+                min_p1_override=bytes_min_p1,
+                min_p2_override=bytes_min_p2,
+                kmeans_ctx=kmeans_model_ctx,
+            )
         elif method == "tlsh":
             if _tlsh is None:
                 ranked_windows = []
@@ -2060,7 +1955,6 @@ def _run_doc_extract(
             if (
                 method in {"bytes", "byte", "size", "size_only"}
                 and (int(candidate_page_count or 0) >= int(K))
-                and str(bytes_ref_mode).strip().lower() != "mean2"
             ):
                 reason = (
                     "no_window_passed_min_scores "
@@ -2088,30 +1982,19 @@ def _run_doc_extract(
             for slot_idx, r in enumerate(tw.per_page, start=1):
                 pi = int(r.get("page_index", -1))
                 if "size_bytes" in r:
-                    if str(bytes_ref_mode).strip().lower() == "mean2":
-                        dnorm = r.get("distance_norm")
-                        if isinstance(dnorm, (int, float)):
-                            _p(
-                                f"page_idx: {pi:>4} | size_bytes={int(r['size_bytes']):>8} "
-                                f"| mean={float(r.get('mean_size') or 0):.1f} "
-                                f"| dist_norm={float(dnorm):.6f} | score={float(r['score']):.4f}"
-                            )
-                        else:
-                            _p(f"page_idx: {pi:>4} | size_bytes={int(r['size_bytes']):>8} | score={float(r['score']):.4f}")
+                    if slot_idx == 1:
+                        slot_cmp = ">"
+                        slot_min = float(bytes_min_p1)
+                    elif slot_idx == 2:
+                        slot_cmp = ">="
+                        slot_min = float(bytes_min_p2)
                     else:
-                        if slot_idx == 1:
-                            slot_cmp = ">"
-                            slot_min = float(bytes_min_p1)
-                        elif slot_idx == 2:
-                            slot_cmp = ">="
-                            slot_min = float(bytes_min_p2)
-                        else:
-                            slot_cmp = ">="
-                            slot_min = float(bytes_min_any)
-                        _p(
-                            f"page_idx: {pi:>4} | size_bytes={int(r['size_bytes']):>8} | score={float(r['score']):.4f}"
-                            f" | min(slot{slot_idx}){slot_cmp}{slot_min:.2f}"
-                        )
+                        slot_cmp = ">="
+                        slot_min = float(bytes_min_any)
+                    _p(
+                        f"page_idx: {pi:>4} | size_bytes={int(r['size_bytes']):>8} | score={float(r['score']):.4f}"
+                        f" | min(slot{slot_idx}){slot_cmp}{slot_min:.2f}"
+                    )
                 elif "hybrid" in r:
                     _p(
                         f"page_idx: {pi:>4} | score={float(r['hybrid']):.4f} "
@@ -2132,9 +2015,6 @@ def _run_doc_extract(
                         f"| sim={float(km_sim):.4f} | dist={float(km_dist):.4f} "
                         f"| cluster={near_c} target={tgt_c}"
                     )
-                mean_dist = tw.meta.get("mean_distance")
-                if isinstance(mean_dist, (int, float)) and str(bytes_ref_mode).strip().lower() == "mean2":
-                    _p(f"mean2: mean_distance={float(mean_dist):.6f} | nearest_pair_distance")
             _pc(f"final_sc: {float(tw.total):.4f}", bold=(pos == 1))
             _p("")
 
@@ -2179,8 +2059,6 @@ def _run_doc_extract(
         }
         if method in {"bytes", "byte", "size", "size_only"} and isinstance(kmeans_summary, dict):
             row["model_reference"]["kmeans"] = kmeans_summary
-        if method in {"bytes", "byte", "size", "size_only"} and isinstance(mean2_summary, dict):
-            row["model_reference"]["mean2"] = mean2_summary
 
         # Add opaque file identity for best window (no content parsing).
         cand_doc = fitz.open(str(cand_pdf))
@@ -2211,12 +2089,6 @@ def _run_doc_extract(
                 row["best_window"]["kmeans_nearest_cluster"] = bw_meta.get("nearest_cluster")
                 row["best_window"]["kmeans_target_cluster"] = bw_meta.get("target_cluster")
                 row["best_window"]["kmeans_is_target_cluster"] = bool(bw_meta.get("is_target_cluster"))
-            if str(bytes_ref_mode).strip().lower() == "mean2":
-                row["best_window"]["mean2_total"] = float(best.total)
-                row["best_window"]["mean2_distance"] = (
-                    float(bw_meta.get("mean_distance")) if isinstance(bw_meta.get("mean_distance"), (int, float)) else None
-                )
-                row["best_window"]["mean2_selection_rule"] = "nearest_contiguous_pair_by_normalized_mean_distance"
             row["best_window"]["size_rules"] = {
                 "min_any": float(bytes_min_any),
                 "min_p1_strict_gt": float(bytes_min_p1),
@@ -2265,7 +2137,6 @@ def _run_doc_extract(
             "model_page_sizes": model_sizes,
             "model_slots": slot_reference,
             "kmeans_reference": kmeans_summary if isinstance(kmeans_summary, dict) else None,
-            "mean2_reference": mean2_summary if isinstance(mean2_summary, dict) else None,
             "outputs": results,
         }
         (out_label_dir / f"manifest__{label}__m{_safe_stem(method)}__{ts}.json").write_text(
@@ -2291,16 +2162,6 @@ def _build_parser() -> argparse.ArgumentParser:
     doc.add_argument("-d", "--despacho", action="append", default=[], help="Spec for DESPACHO PDFs (ex.: :Q4-10)")
     doc.add_argument("-c", "--certidao", action="append", default=[], help="Spec for CERTIDAO_CM PDFs (ex.: :Q3-8)")
     doc.add_argument(
-        "-m",
-        "--method",
-        action="append",
-        nargs="+",
-        default=[],
-        help="Metodo: bytes|tlsh|stream|text|image|all (default: bytes). "
-        "Aceita multiplos: --method bytes stream ou repetido: -m bytes -m stream.",
-    )
-    doc.add_argument("--all", action="store_true", help="Roda todos os metodos em sequencia (bytes, tlsh, stream, text, image).")
-    doc.add_argument(
         "--top-n",
         type=int,
         default=None,
@@ -2317,26 +2178,6 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Override do minimo de score para a pagina 2 no metodo bytes (0..1).",
-    )
-    doc.add_argument(
-        "--bytes-ref-mode",
-        default=None,
-        choices=["robust", "legacy", "kmeans", "mean2"],
-        help=(
-            "Referencia do metodo bytes: robust=mediana/MAD por slot; "
-            "legacy=template unico por slot; "
-            "kmeans=clusterizacao de janelas por bytes com cluster-alvo textual explicito; "
-            "mean2=media de bytes por slot (p1,p2) com exclusao de outliers."
-        ),
-    )
-    doc.add_argument(
-        "--bytes-train-spec",
-        action="append",
-        default=[],
-        help=(
-            "Spec(s) de treino para bytes_ref_mode=kmeans|mean2 (ex.: :D, /dir/despachos). "
-            "Se vazio, usa PDFCATCH_BYTES_TRAIN_SPEC; se vazio, usa as specs do proprio lote."
-        ),
     )
     doc.add_argument(
         "--save-files",
@@ -2487,6 +2328,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     args = _build_parser().parse_args(argv_list)
+    _print_cli_args_snapshot(args)
 
     if args.cmd in {"extract-text", "alt-extract"}:
         anchors_path = str(
@@ -2768,10 +2610,6 @@ def main(argv: list[str] | None = None) -> int:
         active_specs = despacho_specs if despacho_specs else cert_specs
         web_active_pdf_dir = _infer_primary_pdf_dir(root, active_specs)
 
-        if args.all and args.method:
-            console.print("[red]error:[/red] use either --all (all methods) or -m/--method (selected methods), not both.")
-            return 2
-
         top_n = int(args.top_n) if args.top_n is not None else int(os.getenv("PDFCATCH_TOP_N", "5") or "5")
         if top_n <= 0:
             console.print("[red]error:[/red] --top-n deve ser >= 1")
@@ -2782,134 +2620,53 @@ def main(argv: list[str] | None = None) -> int:
         if args.min_p2 is not None and not (0.0 <= float(args.min_p2) <= 1.0):
             console.print("[red]error:[/red] --min-p2 deve estar entre 0 e 1")
             return 2
-        bytes_ref_mode = str(
-            args.bytes_ref_mode
-            or os.getenv("PDFCATCH_BYTES_REF_MODE")
-            or "robust"
-        ).strip().lower()
-        if bytes_ref_mode not in {"robust", "legacy", "kmeans", "mean2"}:
-            console.print("[red]error:[/red] --bytes-ref-mode deve ser robust, legacy, kmeans ou mean2")
-            return 2
 
-        # Normalize method list.
-        raw_methods: list[str] = []
-        for chunk in (args.method or []):
-            if isinstance(chunk, list):
-                raw_methods.extend([str(x) for x in chunk])
-            else:
-                raw_methods.append(str(chunk))
-        methods: list[str]
-        if args.all:
-            methods = ["bytes", "tlsh", "stream", "text", "image"]
-        elif raw_methods:
-            norm: list[str] = []
-            for m in raw_methods:
-                v = str(m).strip().lower()
-                if v in {"byte", "bytes", "size", "size_only"}:
-                    v = "bytes"
-                elif v in {"hash", "tlsh"}:
-                    v = "tlsh"
-                elif v in {"stream", "contents"}:
-                    v = "stream"
-                elif v in {"text", "txt"}:
-                    v = "text"
-                elif v in {"image", "img", "pixels", "dhash"}:
-                    v = "image"
-                elif v == "all":
-                    v = "all"
-                else:
-                    console.print(f"[red]error:[/red] unknown method: {m!r}")
-                    return 2
-                if v not in norm:
-                    norm.append(v)
-            if "all" in norm:
-                if len(norm) > 1:
-                    console.print("[red]error:[/red] --method all nao pode ser combinado com outros metodos.")
-                    return 2
-                methods = list(_ALL_METHODS)
-            else:
-                methods = norm
-        else:
-            methods = ["bytes"]
-
-        selected_methods = list(methods)
+        # Modo unico oficial: Bytes + Kmeans.
+        bytes_ref_mode = "kmeans"
         kmeans_ref_by_label: dict[str, dict[str, Any]] = {}
-        mean2_ref_by_label: dict[str, dict[str, Any]] = {}
-        train_specs_cli = [str(x).strip() for x in (getattr(args, "bytes_train_spec", []) or []) if str(x).strip()]
         train_specs_env = _split_env_terms(str(os.getenv("PDFCATCH_BYTES_TRAIN_SPEC") or ""))
-        if bytes_ref_mode == "kmeans" and "bytes" in selected_methods:
-            for _lab, _specs in [("DESPACHO", despacho_specs), ("CERTIDAO_CM", cert_specs)]:
-                if not _specs:
-                    continue
-                _tpls = [t for t in templates if t.label == _lab]
-                if not _tpls:
-                    console.print(f"[red]error:[/red] no templates for label={_lab} (required by kmeans mode)")
-                    return 2
-                _tpls_seq = sorted(_tpls, key=lambda t: int(t.page_index))
-                _slot_templates = _group_templates_by_slot(_tpls_seq)
-                _train_specs = list(train_specs_cli or train_specs_env or _specs)
-                _train_pdfs = _expand_specs_unique(_train_specs)
-                if not _train_pdfs:
-                    console.print(
-                        f"[red]error:[/red] no train PDFs for label={_lab} in kmeans mode "
-                        f"(train_specs={_train_specs})"
-                    )
-                    return 2
-                try:
-                    _km_ref = _build_kmeans_bytes_reference(
-                        root=root,
-                        slot_templates=_slot_templates,
-                        label=_lab,
-                        train_pdfs=_train_pdfs,
-                    )
-                except Exception as exc:
-                    console.print(f"[red]error:[/red] kmeans reference build failed for {_lab}: {exc}")
-                    return 2
-                kmeans_ref_by_label[_lab] = _km_ref
-                _sm = _km_ref.get("summary") if isinstance(_km_ref.get("summary"), dict) else {}
+        default_train_dir = (root / "PDFs").resolve()
+        for _lab, _specs in [("DESPACHO", despacho_specs), ("CERTIDAO_CM", cert_specs)]:
+            if not _specs:
+                continue
+            _tpls = [t for t in templates if t.label == _lab]
+            if not _tpls:
+                console.print(f"[red]error:[/red] no templates for label={_lab} (required by kmeans mode)")
+                return 2
+            _tpls_seq = sorted(_tpls, key=lambda t: int(t.page_index))
+            _slot_templates = _group_templates_by_slot(_tpls_seq)
+            if train_specs_env:
+                _train_specs = list(train_specs_env)
+            elif default_train_dir.exists() and default_train_dir.is_dir():
+                _train_specs = [str(default_train_dir)]
+            else:
+                _train_specs = list(_specs)
+            _train_pdfs = _expand_specs_unique(_train_specs)
+            if not _train_pdfs:
                 console.print(
-                    "kmeans_ref "
-                    f"label={_lab} target_cluster={_sm.get('target_cluster')} "
-                    f"train_pdfs={_sm.get('train_pdf_count')} windows={_sm.get('train_window_count')} "
-                    f"tips={_sm.get('tip_term_count')}",
-                    style="bright_black",
+                    f"[red]error:[/red] no train PDFs for label={_lab} in kmeans mode "
+                    f"(train_specs={_train_specs})"
                 )
-        if bytes_ref_mode == "mean2" and "bytes" in selected_methods:
-            for _lab, _specs in [("DESPACHO", despacho_specs), ("CERTIDAO_CM", cert_specs)]:
-                if not _specs:
-                    continue
-                _tpls = [t for t in templates if t.label == _lab]
-                if not _tpls:
-                    console.print(f"[red]error:[/red] no templates for label={_lab} (required to resolve slot count)")
-                    return 2
-                _tpls_seq = sorted(_tpls, key=lambda t: int(t.page_index))
-                _slot_templates = _group_templates_by_slot(_tpls_seq)
-                _train_specs = list(train_specs_cli or train_specs_env or _specs)
-                _train_pdfs = _expand_specs_unique(_train_specs)
-                if not _train_pdfs:
-                    console.print(
-                        f"[red]error:[/red] no train PDFs for label={_lab} in mean2 mode "
-                        f"(train_specs={_train_specs})"
-                    )
-                    return 2
-                try:
-                    _m2_ref = _build_mean2_bytes_reference(
-                        slot_templates=_slot_templates,
-                        label=_lab,
-                        train_pdfs=_train_pdfs,
-                    )
-                except Exception as exc:
-                    console.print(f"[red]error:[/red] mean2 reference build failed for {_lab}: {exc}")
-                    return 2
-                mean2_ref_by_label[_lab] = _m2_ref
-                _sm2 = _m2_ref.get("summary") if isinstance(_m2_ref.get("summary"), dict) else {}
-                console.print(
-                    "mean2_ref "
-                    f"label={_lab} train_pdfs={_sm2.get('train_pdf_count')} "
-                    f"raw={_sm2.get('train_doc_count_used_raw')} kept={_sm2.get('train_doc_count_used_kept')} "
-                    f"means={_sm2.get('mean_sizes')}",
-                    style="bright_black",
+                return 2
+            try:
+                _km_ref = _build_kmeans_bytes_reference(
+                    root=root,
+                    slot_templates=_slot_templates,
+                    label=_lab,
+                    train_pdfs=_train_pdfs,
                 )
+            except Exception as exc:
+                console.print(f"[red]error:[/red] kmeans reference build failed for {_lab}: {exc}")
+                return 2
+            kmeans_ref_by_label[_lab] = _km_ref
+            _sm = _km_ref.get("summary") if isinstance(_km_ref.get("summary"), dict) else {}
+            console.print(
+                "kmeans_ref "
+                f"label={_lab} target_cluster={_sm.get('target_cluster')} "
+                f"train_pdfs={_sm.get('train_pdf_count')} windows={_sm.get('train_window_count')} "
+                f"tips={_sm.get('tip_term_count')}",
+                style="bright_black",
+            )
         expected_total_pdfs = 0
         for _lab, _specs in [("DESPACHO", despacho_specs), ("CERTIDAO_CM", cert_specs)]:
             if not _specs:
@@ -2954,131 +2711,40 @@ def main(argv: list[str] | None = None) -> int:
                     )
 
                     rows_for_process: list[dict[str, Any]] = []
-                    for m in selected_methods:
-                        if m == "tlsh" and _tlsh is None:
-                            _emit_line("aviso: tlsh OFF (instale: pip install py-tlsh)", "#b87838")
+                    rows = _run_doc_extract(
+                        root=root,
+                        templates=templates,
+                        label=label,
+                        method="bytes",
+                        specs=[str(pdf_path)],
+                        save_dir=None,
+                        top_n=top_n,
+                        min_p1=(float(args.min_p1) if args.min_p1 is not None else None),
+                        min_p2=(float(args.min_p2) if args.min_p2 is not None else None),
+                        bytes_ref_mode=bytes_ref_mode,
+                        kmeans_reference=kmeans_ref_by_label.get(label),
+                        emit_details=True,
+                        candidate_position=(i, total_pdfs),
+                        console=console,
+                        log_sink=(dashboard.log if dashboard is not None else None),
+                    )
+                    rows_for_process.extend(rows)
+                    all_results.extend(rows)
+                    _emit_line("")
 
-                        rows = _run_doc_extract(
-                            root=root,
-                            templates=templates,
-                            label=label,
-                            method=m,
-                            specs=[str(pdf_path)],
-                            save_dir=None,
-                            top_n=top_n,
-                            min_p1=(float(args.min_p1) if args.min_p1 is not None else None),
-                            min_p2=(float(args.min_p2) if args.min_p2 is not None else None),
-                            bytes_ref_mode=bytes_ref_mode,
-                            kmeans_reference=(
-                                kmeans_ref_by_label.get(label)
-                                if (bytes_ref_mode == "kmeans" and m == "bytes")
-                                else None
-                            ),
-                            mean2_reference=(
-                                mean2_ref_by_label.get(label)
-                                if (bytes_ref_mode == "mean2" and m == "bytes")
-                                else None
-                            ),
-                            emit_details=True,
-                            candidate_position=(i, total_pdfs),
-                            console=console,
-                            log_sink=(dashboard.log if dashboard is not None else None),
-                        )
-                        rows_for_process.extend(rows)
-                        all_results.extend(rows)
-                        _emit_line("")
-
-                    # Final strictly for this process (no mixing with other PDFs).
-                    methods_map: dict[str, dict[str, Any]] = {}
-                    rows_by_method: dict[str, dict[str, Any]] = {}
-                    window_scores_by_method: dict[str, dict[tuple[int, ...], float]] = {}
-                    for r in rows_for_process:
-                        meth = str(r.get("method") or "")
-                        if not meth:
-                            continue
-                        rows_by_method[meth] = r
-                        if r.get("status") == "ok":
-                            methods_map[meth] = {
-                                "status": "ok",
-                                "score": float(r.get("method_score") or 0.0),
-                                "best_window": r.get("best_window"),
-                                "model_reference": r.get("model_reference"),
-                            }
-                            ws: dict[tuple[int, ...], float] = {}
-                            all_windows = r.get("all_windows")
-                            if isinstance(all_windows, list):
-                                for w in all_windows:
-                                    if not isinstance(w, dict):
-                                        continue
-                                    tsc = w.get("total")
-                                    pidx = _page_indices_from_window(w)
-                                    if pidx and isinstance(tsc, (int, float)):
-                                        ws[tuple(pidx)] = float(tsc)
-                            if not ws:
-                                bw = r.get("best_window")
-                                if isinstance(bw, dict):
-                                    tsc = r.get("method_score")
-                                    pidx = _page_indices_from_window(bw)
-                                    if pidx and isinstance(tsc, (int, float)):
-                                        ws[tuple(pidx)] = float(tsc)
-                            window_scores_by_method[meth] = ws
-                        else:
-                            methods_map[meth] = {
-                                "status": "skipped",
-                                "score": None,
-                                "reason": r.get("reason"),
-                                "model_reference": r.get("model_reference"),
-                            }
-                            window_scores_by_method[meth] = {}
-
-                    valid_methods = [m for m in selected_methods if (methods_map.get(m) or {}).get("status") == "ok"]
-                    all_keys: set[tuple[int, ...]] = set()
-                    for m in valid_methods:
-                        all_keys.update(window_scores_by_method.get(m, {}).keys())
-
-                    best_pages: tuple[int, ...] | None = None
-                    best_cov = -1
-                    best_avg = -1.0
-                    best_scores_by_method: dict[str, float] = {}
-                    for key in sorted(all_keys):
-                        scores_for_key: dict[str, float] = {}
-                        for m in valid_methods:
-                            sc = window_scores_by_method.get(m, {}).get(key)
-                            if sc is not None:
-                                scores_for_key[m] = float(sc)
-                        cov = len(scores_for_key)
-                        if cov <= 0:
-                            continue
-                        avg = float(sum(scores_for_key.values()) / float(cov))
-                        if (cov > best_cov) or (cov == best_cov and avg > best_avg):
-                            best_cov = cov
-                            best_avg = avg
-                            best_pages = key
-                            best_scores_by_method = scores_for_key
-
-                    parts: list[str] = []
-                    for m in selected_methods:
-                        sc = best_scores_by_method.get(m)
-                        if sc is None:
-                            parts.append(f"{m}=-")
-                        else:
-                            parts.append(f"{m}={float(sc):.4f}")
-                    method_pages_parts: list[str] = []
-                    for m in selected_methods:
-                        md = methods_map.get(m) if isinstance(methods_map, dict) else None
-                        bw = md.get("best_window") if isinstance(md, dict) else None
-                        midx, mpages = _window_to_idx_pages(bw)
-                        if midx == "-":
-                            method_pages_parts.append(f"{m}=-")
-                        else:
-                            method_pages_parts.append(f"{m}=idx{midx}/p{mpages}")
-
-                    final_score = float(best_avg) if best_pages is not None else None
+                    # Final strictly for this process (single pipeline: Bytes+Kmeans).
+                    row_bk = rows_for_process[0] if rows_for_process else {}
+                    bk_status = str(row_bk.get("status") or "skipped")
+                    bk_score_raw = row_bk.get("method_score")
+                    bk_reason = row_bk.get("reason")
+                    bk_model_ref = row_bk.get("model_reference")
+                    bk_best_window = row_bk.get("best_window") if isinstance(row_bk.get("best_window"), dict) else {}
+                    bpages = _page_indices_from_window(bk_best_window)
+                    final_score = float(bk_score_raw) if (bk_status == "ok" and isinstance(bk_score_raw, (int, float))) else None
                     exported_final_pdf: str | None = None
                     best_window: dict[str, Any] | None = None
                     idx0_txt = "-"
-                    if best_pages is not None:
-                        bpages = [int(v) for v in best_pages]
+                    if bpages:
                         bs, be = int(min(bpages)), int(max(bpages))
                         idx0_txt = _idx0_compact(bpages)
                         best_window = {
@@ -3086,64 +2752,32 @@ def main(argv: list[str] | None = None) -> int:
                             "end_page_index": be,
                             "start_page": bs + 1,
                             "end_page": be + 1,
-                            "page_indices": bpages,
+                            "page_indices": [int(v) for v in bpages],
                         }
 
                     # Export exactly one document per candidate file (the best page index).
-                    if save_dir is not None and best_pages is not None:
-                        bpages = [int(v) for v in best_pages]
-                        if bpages:
-                            sidx, eidx = int(min(bpages)), int(max(bpages))
-                            out_label_dir = (save_dir / label).resolve()
-                            out_label_dir.mkdir(parents=True, exist_ok=True)
-                            cand_path = Path(str(pdf_path)).resolve()
-                            sha = _sha256_file(cand_path)
-                            ts_out = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            idx_tok = _idx0_compact(bpages)
-                            pag_tok = _pages_compact(bpages)
-                            out_name = (
-                                f"{_safe_stem(cand_path.stem)}__{sha[:12]}__{label}__FINAL"
-                                f"__idx{idx_tok}__pag{pag_tok}__{ts_out}.pdf"
-                            )
-                            out_pdf = (out_label_dir / out_name).resolve()
-                            cand_doc = fitz.open(str(cand_path))
+                    if save_dir is not None and bpages:
+                        out_label_dir = (save_dir / label).resolve()
+                        out_label_dir.mkdir(parents=True, exist_ok=True)
+                        cand_path = Path(str(pdf_path)).resolve()
+                        sha = _sha256_file(cand_path)
+                        ts_out = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        idx_tok = _idx0_compact(bpages)
+                        pag_tok = _pages_compact(bpages)
+                        out_name = (
+                            f"{_safe_stem(cand_path.stem)}__{sha[:12]}__{label}__FINAL"
+                            f"__idx{idx_tok}__pag{pag_tok}__{ts_out}.pdf"
+                        )
+                        out_pdf = (out_label_dir / out_name).resolve()
+                        cand_doc = fitz.open(str(cand_path))
+                        try:
+                            _export_pages_pdf(cand_doc, page_indices=bpages, out_path=out_pdf)
+                        finally:
                             try:
-                                _export_pages_pdf(cand_doc, page_indices=bpages, out_path=out_pdf)
-                            finally:
-                                try:
-                                    cand_doc.close()
-                                except Exception:
-                                    pass
-                            exported_final_pdf = str(out_pdf)
-
-                    def _methods_colored(items: list[str]) -> str:
-                        out: list[str] = []
-                        for mm in items:
-                            c = _METHOD_COLORS.get(str(mm).lower(), "white")
-                            out.append(f"[{c}]{mm}[/{c}]")
-                        return ", ".join(out)
-
-                    def _scores_colored(items: list[str]) -> str:
-                        out: list[str] = []
-                        for it in items:
-                            k, v = (it.split("=", 1) + [""])[:2] if "=" in it else (it, "")
-                            c = _METHOD_COLORS.get(str(k).lower(), "white")
-                            if "=" in it:
-                                out.append(f"[{c}]{k}[/{c}]={v}")
-                            else:
-                                out.append(f"[{c}]{it}[/{c}]")
-                        return ", ".join(out)
-
-                    def _method_pages_colored(items: list[str]) -> str:
-                        out: list[str] = []
-                        for it in items:
-                            k, v = (it.split("=", 1) + [""])[:2] if "=" in it else (it, "")
-                            c = _METHOD_COLORS.get(str(k).lower(), "white")
-                            if "=" in it:
-                                out.append(f"[{c}]{k}[/{c}]={v}")
-                            else:
-                                out.append(f"[{c}]{it}[/{c}]")
-                        return ", ".join(out)
+                                cand_doc.close()
+                            except Exception:
+                                pass
+                        exported_final_pdf = str(out_pdf)
 
                     def _kv_line(key: str, value: str, *, value_style: str = "white", raw_markup: bool = False) -> None:
                         if raw_markup:
@@ -3158,18 +2792,17 @@ def main(argv: list[str] | None = None) -> int:
                         _kv_line("PROCESSO", str(process_id))
                         _kv_line("ARQUIVO", str(pdf_path.name))
                         _kv_line("LABEL", str(label))
-                        _kv_line("METODOS", _methods_colored(selected_methods), raw_markup=True)
-                        _emit_line("DET_MET  = metodo -> idx0/pages | score", "bright_black")
-                        for m in selected_methods:
-                            md = methods_map.get(m) if isinstance(methods_map, dict) else None
-                            bw = md.get("best_window") if isinstance(md, dict) else None
-                            midx, mpages = _window_to_idx_pages(bw)
-                            mscore = md.get("score") if isinstance(md, dict) else None
-                            if midx == "-" or not isinstance(mscore, (int, float)):
-                                line = f"{m:<8} -> -"
-                            else:
-                                line = f"{m:<8} -> idx{midx}/p{mpages} | {float(mscore):.4f}"
-                            _emit_line(line, "bright_black")
+                        _kv_line("PIPELINE", "Bytes+Kmeans")
+                        _emit_line("DET     = bytes+kmeans -> idx0/pages | score", "bright_black")
+                        if best_window is None or final_score is None:
+                            _emit_line("bytes+kmeans -> -", "bright_black")
+                        else:
+                            _emit_line(
+                                f"bytes+kmeans -> idx{idx0_txt}/p{_pages_compact(bpages)} | {final_score:.4f}",
+                                "bright_black",
+                            )
+                        if bk_status != "ok" and bk_reason:
+                            _emit_line(f"reason  = {bk_reason}", "bright_black")
                         if final_score is None:
                             _kv_line("FINAL_SC", "-")
                             _kv_line("BEST_IDX", "-")
@@ -3185,15 +2818,21 @@ def main(argv: list[str] | None = None) -> int:
                             "label": label,
                             "process_id": process_id,
                             "candidate_pdf": str(pdf_path),
-                            "selected_methods": selected_methods,
-                            "bytes_ref_mode": bytes_ref_mode,
-                            "methods": methods_map,
+                            "pipeline": "Bytes+Kmeans",
+                            "bytes_ref_mode": "kmeans",
+                            "bytes_kmeans": {
+                                "status": bk_status,
+                                "score": final_score,
+                                "reason": bk_reason,
+                                "best_window": bk_best_window,
+                                "model_reference": bk_model_ref,
+                            },
                             "final_score": final_score,
                             "best_window": best_window,
-                            "scores_line": ", ".join(parts),
-                            "scores_line_colored": _scores_colored(parts),
-                            "method_pages_line": ", ".join(method_pages_parts),
-                            "method_pages_line_colored": _method_pages_colored(method_pages_parts),
+                            "scores_line": (f"bytes+kmeans={final_score:.4f}" if isinstance(final_score, float) else "bytes+kmeans=-"),
+                            "scores_line_colored": (f"bytes+kmeans={final_score:.4f}" if isinstance(final_score, float) else "bytes+kmeans=-"),
+                            "method_pages_line": (f"bytes+kmeans=idx{idx0_txt}/p{_pages_compact(bpages)}" if bpages else "bytes+kmeans=-"),
+                            "method_pages_line_colored": (f"bytes+kmeans=idx{idx0_txt}/p{_pages_compact(bpages)}" if bpages else "bytes+kmeans=-"),
                             "best_idx0": idx0_txt,
                             "exported_pdf_final": exported_final_pdf,
                         }
@@ -3216,14 +2855,11 @@ def main(argv: list[str] | None = None) -> int:
             idx = {
                 "run_ts": ts,
                 "save_dir": str(save_dir),
-                "selected_methods": selected_methods,
+                "pipeline": "Bytes+Kmeans",
+                "bytes_ref_mode": "kmeans",
                 "kmeans_reference_by_label": {
                     str(k): (v.get("summary") if isinstance(v, dict) else None)
                     for k, v in kmeans_ref_by_label.items()
-                },
-                "mean2_reference_by_label": {
-                    str(k): (v.get("summary") if isinstance(v, dict) else None)
-                    for k, v in mean2_ref_by_label.items()
                 },
                 "outputs": all_results,
                 "process_summaries": process_summaries,
@@ -3245,22 +2881,11 @@ def main(argv: list[str] | None = None) -> int:
                 page_indices = bw.get("page_indices") if isinstance(bw, dict) else None
                 if not isinstance(page_indices, list):
                     page_indices = []
-                meth_out: dict[str, Any] = {}
-                methods_map = ps.get("methods")
-                if isinstance(methods_map, dict):
-                    for mk, mv in methods_map.items():
-                        if not isinstance(mv, dict):
-                            continue
-                        mbw = mv.get("best_window") if isinstance(mv.get("best_window"), dict) else {}
-                        mpidx = mbw.get("page_indices") if isinstance(mbw, dict) else None
-                        if not isinstance(mpidx, list):
-                            mpidx = []
-                        meth_out[str(mk)] = {
-                            "status": mv.get("status"),
-                            "score": mv.get("score"),
-                            "page_indices": mpidx,
-                            "model_reference": mv.get("model_reference"),
-                        }
+                bk = ps.get("bytes_kmeans") if isinstance(ps.get("bytes_kmeans"), dict) else {}
+                mbw = bk.get("best_window") if isinstance(bk.get("best_window"), dict) else {}
+                mpidx = mbw.get("page_indices") if isinstance(mbw, dict) else []
+                if not isinstance(mpidx, list):
+                    mpidx = []
                 detected_compact.append(
                     {
                         "process_id": ps.get("process_id"),
@@ -3270,7 +2895,12 @@ def main(argv: list[str] | None = None) -> int:
                         "final_score": ps.get("final_score"),
                         "best_idx0": ps.get("best_idx0"),
                         "best_page_indices": page_indices,
-                        "methods": meth_out,
+                        "bytes_kmeans": {
+                            "status": bk.get("status"),
+                            "score": bk.get("score"),
+                            "page_indices": mpidx,
+                            "model_reference": bk.get("model_reference"),
+                        },
                     }
                 )
             ret_payload = {
@@ -3278,17 +2908,13 @@ def main(argv: list[str] | None = None) -> int:
                 "run_ts": ts_ret,
                 "command": "doc",
                 "cwd": str(root),
-                "templates_json": str(templates_json),
-                "bytes_ref_mode": bytes_ref_mode,
-                "selected_methods": selected_methods,
+                "templates_json": (str(templates_json) if isinstance(templates_json, Path) else None),
+                "pipeline": "Bytes+Kmeans",
+                "bytes_ref_mode": "kmeans",
                 "top_n": int(top_n),
                 "kmeans_reference_by_label": {
                     str(k): (v.get("summary") if isinstance(v, dict) else None)
                     for k, v in kmeans_ref_by_label.items()
-                },
-                "mean2_reference_by_label": {
-                    str(k): (v.get("summary") if isinstance(v, dict) else None)
-                    for k, v in mean2_ref_by_label.items()
                 },
                 "input_specs": {
                     "despacho": despacho_specs,

@@ -41,3 +41,10 @@ Templates/*
 # Local config
 configs/run.env
 configs/template_library_meta.json
+
+# IO runtime (encadeamento entre modulos)
+io/out/*.json
+io/in/*.json
+!io/.gitkeep
+!io/in/.gitkeep
+!io/out/.gitkeep
