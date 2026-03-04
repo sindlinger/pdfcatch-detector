@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -15,12 +14,10 @@ from pdfcatch.family.features import (
     FEATURE_FIELDS,
     extract_page_features_from_doc,
     extract_page_text_from_doc,
-    extract_page_tokens_from_doc,
 )
 
 CATALOG_PAGE_INDEX = 0
 POSITIVE_CONFIDENCE = {"high", "medium"}
-TOKEN_PAGE_MAX_TERMS = 512
 AI_MODEL_DEFAULT = "BAAI/bge-reranker-v2-m3"
 AI_BATCH_SIZE_DEFAULT = 16
 AI_MAX_EXAMPLES_DEFAULT = 4
@@ -50,8 +47,6 @@ def _empty_result(page_idx: int, *, confidence: str, status: str) -> dict[str, A
         "rule_applied": None,
         "selection_strategy": None,
         "family_similarity_pct": None,
-        "token_similarity_pct": None,
-        "token_stage": None,
         "ai_similarity_pct": None,
         "ai_stage": None,
         "feature_similarity_pct": None,
@@ -107,7 +102,6 @@ def _family_meta_from_page(page_ref: dict[str, Any], family_id: int) -> dict[str
                 return {
                     "dist_mean": row.get("family_dist_mean"),
                     "dist_max": row.get("family_dist_max"),
-                    "family_token_model": row.get("family_token_model"),
                     "family_reference_examples": row.get("family_reference_examples"),
                 }
     return None
@@ -132,99 +126,6 @@ def _resolve_family_confidence(
 def _feature_similarity_pct(delta_z: float) -> float:
     # 100% quando igual ao centróide; cai suavemente conforme aumenta o delta normalizado.
     return float(max(0.0, min(100.0, 100.0 * np.exp(-0.5 * (delta_z**2)))))
-
-
-def _tokens_to_weights(tokens: list[str], max_terms: int) -> dict[str, float]:
-    counter: Counter[str] = Counter(tokens or [])
-    total = int(sum(counter.values()))
-    if total <= 0:
-        return {}
-    out: dict[str, float] = {}
-    for token, count in counter.most_common(max_terms):
-        out[str(token)] = float(int(count) / total)
-    return out
-
-
-def _family_token_weights(family_meta: dict[str, Any] | None) -> dict[str, float]:
-    model = (family_meta or {}).get("family_token_model")
-    if not isinstance(model, dict):
-        model = (family_meta or {}).get("token_model")
-    if not isinstance(model, dict):
-        return {}
-    terms = model.get("terms")
-    if not isinstance(terms, list):
-        return {}
-
-    out: dict[str, float] = {}
-    total_from_count = 0.0
-    count_map: dict[str, float] = {}
-    for row in terms:
-        if not isinstance(row, dict):
-            continue
-        token = str(row.get("token") or "").strip()
-        if not token:
-            continue
-        weight = _safe_float(row.get("weight"))
-        if weight is not None and weight > 0:
-            out[token] = float(weight)
-            continue
-        count = _safe_float(row.get("count"))
-        if count is not None and count > 0:
-            count_map[token] = float(count)
-            total_from_count += float(count)
-
-    if out:
-        norm = float(sum(out.values()))
-        if norm > 0:
-            return {k: float(v / norm) for k, v in out.items()}
-        return {}
-    if total_from_count > 0:
-        return {k: float(v / total_from_count) for k, v in count_map.items()}
-    return {}
-
-
-def _token_similarity_stage(page_weights: dict[str, float], family_weights: dict[str, float]) -> dict[str, Any]:
-    if not page_weights or not family_weights:
-        return {
-            "status": "unavailable",
-            "token_similarity_pct": None,
-            "weighted_jaccard": None,
-            "cosine": None,
-            "shared_terms": 0,
-            "page_terms": int(len(page_weights)),
-            "family_terms": int(len(family_weights)),
-        }
-
-    keys = set(page_weights.keys()) | set(family_weights.keys())
-    num = 0.0
-    den = 0.0
-    dot = 0.0
-    sum_page_sq = 0.0
-    sum_family_sq = 0.0
-    shared_terms = 0
-    for k in keys:
-        pv = float(page_weights.get(k, 0.0))
-        fv = float(family_weights.get(k, 0.0))
-        num += min(pv, fv)
-        den += max(pv, fv)
-        dot += pv * fv
-        sum_page_sq += pv * pv
-        sum_family_sq += fv * fv
-        if pv > 0.0 and fv > 0.0:
-            shared_terms += 1
-
-    weighted_jaccard = float(num / den) if den > 0 else 0.0
-    cosine = float(dot / ((sum_page_sq ** 0.5) * (sum_family_sq ** 0.5))) if sum_page_sq > 0 and sum_family_sq > 0 else 0.0
-    token_similarity_pct = float(round((0.5 * weighted_jaccard + 0.5 * cosine) * 100.0, 2))
-    return {
-        "status": "ok",
-        "token_similarity_pct": token_similarity_pct,
-        "weighted_jaccard": float(round(weighted_jaccard, 6)),
-        "cosine": float(round(cosine, 6)),
-        "shared_terms": int(shared_terms),
-        "page_terms": int(len(page_weights)),
-        "family_terms": int(len(family_weights)),
-    }
 
 
 def _require_ai_gpu_runtime(model_name: str) -> dict[str, Any]:
@@ -293,17 +194,6 @@ def _family_reference_texts(family_meta: dict[str, Any] | None, max_examples: in
         return []
 
     texts: list[str] = []
-
-    token_model = (family_meta or {}).get("family_token_model")
-    if not isinstance(token_model, dict):
-        token_model = (family_meta or {}).get("token_model")
-    if isinstance(token_model, dict):
-        refs = token_model.get("reference_texts")
-        if isinstance(refs, list):
-            for t in refs:
-                s = str(t or "").strip()
-                if s:
-                    texts.append(s)
 
     for key in ("family_reference_examples", "examples"):
         arr = (family_meta or {}).get(key)
@@ -430,7 +320,6 @@ def _score_family(
     z: np.ndarray,
     page_idx: int,
     page_ref: dict[str, Any],
-    page_tokens: list[str] | None = None,
     page_text: str = "",
     ai_runtime: dict[str, Any] | None = None,
     ai_batch_size: int = AI_BATCH_SIZE_DEFAULT,
@@ -441,7 +330,6 @@ def _score_family(
         return _empty_result(page_idx, confidence="uncataloged_page", status="uncataloged_page")
 
     family_comparison: list[dict[str, Any]] = []
-    page_weights = _tokens_to_weights(page_tokens or [], TOKEN_PAGE_MAX_TERMS)
     for cid in range(cents.shape[0]):
         centroid = cents[cid]
         delta = np.abs(centroid - z)
@@ -462,8 +350,6 @@ def _score_family(
         )
         family_meta = _family_meta_from_page(page_ref, cid)
         confidence, family_status, thresholds, rule = _resolve_family_confidence(distance, family_meta)
-        family_weights = _family_token_weights(family_meta)
-        token_stage = _token_similarity_stage(page_weights, family_weights)
         ai_stage = _ai_similarity_stage(
             page_text,
             family_meta,
@@ -476,8 +362,6 @@ def _score_family(
                 "family_id": int(cid),
                 "distance": distance,
                 "similarity_pct": similarity_pct,
-                "token_similarity_pct": token_stage["token_similarity_pct"],
-                "token_stage": token_stage,
                 "ai_similarity_pct": ai_stage.get("ai_similarity_pct"),
                 "ai_stage": ai_stage,
                 "confidence": confidence,
@@ -521,8 +405,6 @@ def _score_family(
         "rule_applied": str(best_cmp["rule_applied"]),
         "selection_strategy": selection_strategy,
         "family_similarity_pct": float(best_cmp["similarity_pct"]),
-        "token_similarity_pct": best_cmp.get("token_similarity_pct"),
-        "token_stage": dict(best_cmp.get("token_stage") or {}),
         "ai_similarity_pct": best_cmp.get("ai_similarity_pct"),
         "ai_stage": dict(best_cmp.get("ai_stage") or {}),
         "feature_similarity_pct": dict(best_cmp["feature_similarity_pct"]),
@@ -535,7 +417,6 @@ def score_page_against_catalog(
     feat: list[float],
     ref: dict,
     page_idx: int,
-    page_tokens: list[str] | None = None,
     page_text: str = "",
     ai_runtime: dict[str, Any] | None = None,
     ai_batch_size: int = AI_BATCH_SIZE_DEFAULT,
@@ -578,7 +459,6 @@ def score_page_against_catalog(
         z,
         page_idx,
         page_ref,
-        page_tokens=page_tokens,
         page_text=page_text,
         ai_runtime=ai_runtime,
         ai_batch_size=ai_batch_size,
@@ -651,14 +531,12 @@ def score_pdf_against_catalog(
                 continue
             if not feat:
                 continue
-            tokens = extract_page_tokens_from_doc(doc, source_page_idx)
             page_text = extract_page_text_from_doc(doc, source_page_idx)
             try:
                 res = score_page_against_catalog(
                     feat,
                     ref,
                     source_page_idx,
-                    page_tokens=tokens,
                     page_text=page_text,
                     ai_runtime=ai_runtime,
                     ai_batch_size=ai_batch_size,

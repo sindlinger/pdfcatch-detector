@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import json
 import shutil
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,7 +31,6 @@ from pdfcatch.family.catalog_registry import (
 from pdfcatch.family.features import (
     FEATURE_FIELDS,
     extract_page_text_from_doc,
-    extract_page_tokens_from_doc,
     normalize_matrix,
 )
 
@@ -68,12 +66,12 @@ CLASSIFICATION_CONTRACT = {
     "distance_metric": "euclidean_on_normalized_features",
     "mode_routing": "catalog_only",
     "inference_search_scope": "separate_phase_outside_catalog",
-    "token_similarity_stage": {
+    "text_similarity_stage": {
         "enabled": True,
-        "selection_impact": "advisory_separate_stage",
-        "family_token_model": "tf_top_terms_weighted",
-        "similarity_metrics": ["weighted_jaccard", "cosine"],
-        "primary_output_field": "token_similarity_pct",
+        "selection_impact": "neural_gpu_stage",
+        "reference_model": "crossencoder_gpu_reference_examples",
+        "similarity_metrics": ["crossencoder_gpu"],
+        "primary_output_field": "ai_similarity_pct",
     },
     "ai_lexical_stage": {
         "enabled": True,
@@ -93,8 +91,6 @@ CLASSIFICATION_CONTRACT = {
     },
 }
 
-TOKEN_PROFILE_MAX_TERMS = 256
-TOKEN_REFERENCE_TEXTS_MAX = 6
 TOKEN_REFERENCE_EXCERPT_CHARS = 1800
 
 def _warn(msg: str) -> None:
@@ -155,10 +151,9 @@ def _normalize_excerpt(text: str, max_chars: int = TOKEN_REFERENCE_EXCERPT_CHARS
     return compact[:max_chars]
 
 
-def _collect_row_lexical(sub: pd.DataFrame) -> tuple[list[list[str]], list[str]]:
-    rows_tokens: list[list[str]] = []
+def _collect_row_texts(sub: pd.DataFrame) -> list[str]:
     rows_texts: list[str] = []
-    cache: dict[str, tuple[list[str], str]] = {}
+    cache: dict[str, str] = {}
     missing_paths = 0
     read_errors = 0
 
@@ -166,23 +161,18 @@ def _collect_row_lexical(sub: pd.DataFrame) -> tuple[list[list[str]], list[str]]
         pdf_path = _resolve_pdf_path_from_row(row)
         if pdf_path is None:
             missing_paths += 1
-            rows_tokens.append([])
             rows_texts.append("")
             continue
 
         key = str(pdf_path)
         if key in cache:
-            toks, txt = cache[key]
-            rows_tokens.append(toks)
-            rows_texts.append(txt)
+            rows_texts.append(cache[key])
             continue
 
-        tokens: list[str] = []
         text = ""
         try:
             doc = fitz.open(pdf_path)
             try:
-                tokens = extract_page_tokens_from_doc(doc, 0)
                 text = extract_page_text_from_doc(doc, 0)
             finally:
                 try:
@@ -191,69 +181,24 @@ def _collect_row_lexical(sub: pd.DataFrame) -> tuple[list[list[str]], list[str]]
                     pass
         except Exception:
             read_errors += 1
-            tokens = []
             text = ""
 
-        cache[key] = (tokens, text)
-        rows_tokens.append(tokens)
+        cache[key] = text
         rows_texts.append(text)
 
     if missing_paths:
         _warn(
             "nao foi possível resolver o caminho de "
-            f"{missing_paths} amostras para montar perfil lexical; "
-            "token_similarity e ai_similarity serão parciais para essas entradas"
+            f"{missing_paths} amostras para montar perfil textual; "
+            "ai_similarity será parcial para essas entradas"
         )
     if read_errors:
         _warn(
-            f"falha ao ler {read_errors} PDFs para perfil lexical; "
-            "token_similarity e ai_similarity serão parciais para essas entradas"
+            f"falha ao ler {read_errors} PDFs para perfil textual; "
+            "ai_similarity será parcial para essas entradas"
         )
 
-    return rows_tokens, rows_texts
-
-
-def _build_family_token_model(family_tokens: list[list[str]], family_texts: list[str]) -> dict[str, Any]:
-    counter: Counter[str] = Counter()
-    for toks in family_tokens:
-        counter.update(toks)
-    reference_texts = [_normalize_excerpt(t) for t in family_texts]
-    reference_texts = [t for t in reference_texts if t][:TOKEN_REFERENCE_TEXTS_MAX]
-
-    total_tokens = int(sum(counter.values()))
-    unique_tokens = int(len(counter))
-    if total_tokens <= 0:
-        return {
-            "method": "tf_top_terms_weighted",
-            "total_tokens": 0,
-            "unique_tokens": 0,
-            "terms_kept": 0,
-            "terms": [],
-            "reference_texts": reference_texts,
-        }
-
-    terms = []
-    kept_total = 0
-    for token, count in counter.most_common(TOKEN_PROFILE_MAX_TERMS):
-        c = int(count)
-        kept_total += c
-        terms.append(
-            {
-                "token": token,
-                "count": c,
-                "weight": float(c / total_tokens),
-            }
-        )
-
-    return {
-        "method": "tf_top_terms_weighted",
-        "total_tokens": total_tokens,
-        "unique_tokens": unique_tokens,
-        "terms_kept": int(len(terms)),
-        "terms_coverage_pct": float((kept_total / total_tokens) * 100.0),
-        "terms": terms,
-        "reference_texts": reference_texts,
-    }
+    return rows_texts
 
 
 def _build_catalog_manifest(df: pd.DataFrame, csv_path: Path) -> dict[str, Any]:
@@ -326,7 +271,6 @@ def _build_family_catalog(
     sub: pd.DataFrame,
     X: np.ndarray,
     Xn_arr: np.ndarray,
-    row_tokens: list[list[str]],
     row_texts: list[str],
     k: int,
     examples: int,
@@ -358,10 +302,6 @@ def _build_family_catalog(
             )
         members.sort(key=lambda m: m["dist_norm"])
         dvals = [m["dist_norm"] for m in members]
-        token_model = _build_family_token_model(
-            [row_tokens[i] for i in idxs],
-            [row_texts[i] for i in idxs],
-        )
         family_rec = {
             "family_id": int(cid),
             "family_centroid_norm": cent[cid],
@@ -370,7 +310,6 @@ def _build_family_catalog(
             "family_dist_mean": float(np.mean(dvals)),
             "family_dist_max": float(np.max(dvals)),
             "family_reference_examples": members[: min(len(members), examples)],
-            "family_token_model": token_model,
         }
         family_registry.append(family_rec)
         # Compatibilidade com consumidores antigos.
@@ -382,7 +321,6 @@ def _build_family_catalog(
             "dist_mean": family_rec["family_dist_mean"],
             "dist_max": family_rec["family_dist_max"],
             "examples": family_rec["family_reference_examples"],
-            "token_model": token_model,
         }
 
     family_registry.sort(key=lambda r: int(r["family_id"]))
@@ -493,7 +431,7 @@ def run(
     page_idx = 0
     sub = df
     X = sub[FEATURE_FIELDS].to_numpy(dtype=float)
-    row_tokens, row_texts = _collect_row_lexical(sub)
+    row_texts = _collect_row_texts(sub)
     mean, std, Xn = normalize_matrix(X.tolist())
     Xn_arr = np.array(Xn, dtype=float)
     if len(sub) < int(k):
@@ -506,7 +444,6 @@ def run(
         sub=sub,
         X=X,
         Xn_arr=Xn_arr,
-        row_tokens=row_tokens,
         row_texts=row_texts,
         k=int(k),
         examples=int(examples),

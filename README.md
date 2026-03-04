@@ -28,10 +28,9 @@ Pergunta que essa fase responde: **"este documento pertence a qual família conh
 - **Fase 2: inferência separada via `similarity_search`**
 Objetivo: aplicar o catálogo em diretório misto/quarentena, sem novo registro de referência.
 - **`similarity_score` (núcleo)**
-Objetivo: pontuar cada página contra todas as famílias catalogadas em três etapas:
+Objetivo: pontuar cada página contra todas as famílias catalogadas em duas etapas:
 1) estrutural por features (`distance`, `similarity_pct`, `feature_similarity_pct`, `feature_delta_z`);
-2) lexical por tokenização (`token_similarity_pct`, `token_stage`);
-3) lexical por IA (`ai_similarity_pct`, `ai_stage`) com GPU obrigatória.
+2) textual neural (`ai_similarity_pct`, `ai_stage`) com GPU obrigatória.
 - **`live`**
 Objetivo: aplicar em lote e dar visão operacional (`mode`, `family_id`, `match`, `confidence`).
 
@@ -129,6 +128,16 @@ PYTHONPATH=src:. python -m pdfcatch.family.ai_paradigm_validate \
   --report-out io/out/despacho_paradigm_validation.json
 ```
 
+Validação por tokenização neural de alta precisão (CrossEncoder GPU, capa vs paradigma, só página 0):
+
+```bash
+PYTHONPATH=src:. python -m pdfcatch.family.token_paradigm_validate \
+  --dir /caminho/so_com_despachos_validados \
+  --paradigm-out io/out/despacho_token_paradigm.json \
+  --report-out io/out/despacho_token_validation.json \
+  --model BAAI/bge-reranker-v2-m3
+```
+
 Atualização de catálogo existente (somente com autorização explícita):
 
 ```json
@@ -154,8 +163,6 @@ No JSON salvo da inferência, cada página retorna:
 - `family_comparison`: comparação com todas as famílias catalogadas (A, B, C...).
 - `distance`: distância para cada família.
 - `similarity_pct`: percentual geral de semelhança da página com cada família.
-- `token_similarity_pct`: percentual de semelhança lexical da página com cada família (etapa separada).
-- `token_stage`: detalhes da etapa lexical (weighted_jaccard, cosine, termos compartilhados).
 - `ai_similarity_pct`: percentual de semelhança lexical por IA (CrossEncoder em GPU).
 - `ai_stage`: detalhes do estágio de IA (modelo, device, melhor candidato, score).
 - `feature_similarity_pct`: percentual por feature (`chars`, `token_count`, `fill_percent`, etc.) para cada família.
