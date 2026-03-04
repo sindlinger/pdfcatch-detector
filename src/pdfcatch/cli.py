@@ -22,10 +22,7 @@ from dotenv import load_dotenv
 import fitz  # PyMuPDF
 
 from pdfcatch.main import TemplateRef
-from Modules.detector.image.dhash import dhash_score, page_dhash
-from Modules.detector.stream.contents import fingerprint_page_contents, open_pdf as open_pikepdf, stream_similarity
-from Modules.detector.text.metrics import score_text
-from Modules.extrator.text_anchors import extract_pdf_by_anchors, load_anchor_rules
+# Imports removidos: modos image/stream/text/extrator não usados
 
 try:
     import tlsh as _tlsh  # optional (py-tlsh)
@@ -1942,6 +1939,41 @@ def _run_doc_extract(
         if ranked_extras and best is not None:
             extra_best = ranked_extras[0]
 
+        # Scores por página (para bytes)
+        per_page_scores: dict[int, list[dict[str, Any]]] = {}
+        for w in ranked_windows:
+            wp = _window_payload(w)
+            for r in w.per_page:
+                pi = r.get("page_index")
+                if not isinstance(pi, int):
+                    continue
+                sc = float(r.get("score", 0.0))
+                per_page_scores.setdefault(pi, []).append({"page_index": pi, "score": sc, "window": wp})
+        for pi in per_page_scores:
+            per_page_scores[pi].sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+            per_page_scores[pi] = per_page_scores[pi][:top_n]
+
+        def _pick_best_pair():
+            # Regra: tentar melhor p0 com até top3 p1; senão p0 (2º) com top3 p1; senão p0 (3º) com top3 p1
+            if len(per_page_scores) < 2:
+                return None
+            p0 = min(per_page_scores.keys())
+            p1 = p0 + 1
+            a_list = per_page_scores.get(p0, [])[:3]
+            b_list = per_page_scores.get(p1, [])[:3]
+            for a in a_list:
+                for b in b_list:
+                    if int(b["page_index"]) == int(a["page_index"]) + 1:
+                        return {"p0": a, "p1": b, "score_pair": (float(a["score"]) + float(b["score"])) / 2.0}
+            return None
+
+        best_pair = _pick_best_pair()
+        score_p0 = per_page_scores.get(min(per_page_scores) if per_page_scores else 0, [{}])[0].get("score") if per_page_scores else None
+        score_p1 = None
+        if len(per_page_scores) >= 2:
+            p1_idx = min(per_page_scores) + 1
+            score_p1 = per_page_scores.get(p1_idx, [{}])[0].get("score")
+
         analyzed = int(window_count or 0)
         shown_top = int(min(max(1, int(top_n)), len(top_windows) if ranked_windows else max(1, int(top_n))))
         _pc(f"PAGES   = {analyzed}", bold=True)
@@ -2055,6 +2087,10 @@ def _run_doc_extract(
             },
             "top_windows": [_window_payload(w) for w in top_windows],
             "all_windows": [_window_payload(w) for w in ranked_windows],
+            "per_page_top": per_page_scores,
+            "best_pair": best_pair,
+            "score_p0": score_p0,
+            "score_p1": score_p1,
             "status": "ok",
         }
         if method in {"bytes", "byte", "size", "size_only"} and isinstance(kmeans_summary, dict):
@@ -2711,23 +2747,24 @@ def main(argv: list[str] | None = None) -> int:
                     )
 
                     rows_for_process: list[dict[str, Any]] = []
-                    rows = _run_doc_extract(
-                        root=root,
-                        templates=templates,
-                        label=label,
-                        method="bytes",
-                        specs=[str(pdf_path)],
-                        save_dir=None,
-                        top_n=top_n,
-                        min_p1=(float(args.min_p1) if args.min_p1 is not None else None),
-                        min_p2=(float(args.min_p2) if args.min_p2 is not None else None),
-                        bytes_ref_mode=bytes_ref_mode,
-                        kmeans_reference=kmeans_ref_by_label.get(label),
-                        emit_details=True,
-                        candidate_position=(i, total_pdfs),
-                        console=console,
-                        log_sink=(dashboard.log if dashboard is not None else None),
-                    )
+    rows = _run_doc_extract(
+        root=root,
+        templates=templates,
+        label=label,
+        method="bytes",
+        specs=[str(pdf_path)],
+        save_dir=None,
+        top_n=top_n,
+        min_p1=(float(args.min_p1) if args.min_p1 is not None else None),
+        min_p2=(float(args.min_p2) if args.min_p2 is not None else None),
+        bytes_ref_mode=bytes_ref_mode,
+        kmeans_reference=kmeans_ref_by_label.get(label),
+        emit_details=True,
+        candidate_position=(i, total_pdfs),
+        console=console,
+        log_sink=(dashboard.log if dashboard is not None else None),
+        top_n_per_page=True,
+    )
                     rows_for_process.extend(rows)
                     all_results.extend(rows)
                     _emit_line("")
@@ -2792,20 +2829,40 @@ def main(argv: list[str] | None = None) -> int:
                         _kv_line("PROCESSO", str(process_id))
                         _kv_line("ARQUIVO", str(pdf_path.name))
                         _kv_line("LABEL", str(label))
-                        _kv_line("PIPELINE", "Bytes+Kmeans")
-                        _emit_line("DET     = bytes+kmeans -> idx0/pages | score", "bright_black")
-                        if best_window is None or final_score is None:
-                            _emit_line("bytes+kmeans -> -", "bright_black")
-                        else:
-                            _emit_line(
-                                f"bytes+kmeans -> idx{idx0_txt}/p{_pages_compact(bpages)} | {final_score:.4f}",
-                                "bright_black",
-                            )
-                        if bk_status != "ok" and bk_reason:
-                            _emit_line(f"reason  = {bk_reason}", "bright_black")
-                        if final_score is None:
-                            _kv_line("FINAL_SC", "-")
-                            _kv_line("BEST_IDX", "-")
+                    _kv_line("PIPELINE", "Bytes+Kmeans")
+                    _emit_line("DET     = bytes+kmeans -> idx0/pages | score", "bright_black")
+                    if best_window is None or final_score is None:
+                        _emit_line("bytes+kmeans -> -", "bright_black")
+                    else:
+                        _emit_line(
+                            f"bytes+kmeans -> idx{idx0_txt}/p{_pages_compact(bpages)} | {final_score:.4f}",
+                            "bright_black",
+                        )
+                    # Mostrar scores separados por página e top-N por página
+                    sp0 = row_bk.get("score_p0") if isinstance(row_bk, dict) else None
+                    sp1 = row_bk.get("score_p1") if isinstance(row_bk, dict) else None
+                    if sp0 is not None:
+                        _kv_line("SCORE_P1", f"{float(sp0):.4f}", value_style="white")
+                    if sp1 is not None:
+                        _kv_line("SCORE_P2", f"{float(sp1):.4f}", value_style="white")
+                    per_top = row_bk.get("per_page_top") if isinstance(row_bk, dict) else {}
+                    if per_top:
+                        for pi in sorted(per_top.keys()):
+                            tops = per_top[pi]
+                            tops_txt = "; ".join([f"p{pi}#{k+1}:{t['score']:.4f}" for k, t in enumerate(tops)])
+                            _emit_line(f"TOP p{pi}: {tops_txt}", "bright_black")
+                    bp = row_bk.get("best_pair") if isinstance(row_bk, dict) else None
+                    if bp:
+                        _emit_line(
+                            f"PAIR p{bp['p0']['page_index']}:{bp['p0']['score']:.4f} + "
+                            f"p{bp['p1']['page_index']}:{bp['p1']['score']:.4f} => {bp['score_pair']:.4f}",
+                            "bright_black",
+                        )
+                    if bk_status != "ok" and bk_reason:
+                        _emit_line(f"reason  = {bk_reason}", "bright_black")
+                    if final_score is None:
+                        _kv_line("FINAL_SC", "-")
+                        _kv_line("BEST_IDX", "-")
                         else:
                             _kv_line("FINAL_SC", f"{final_score:.4f} ({final_score*100.0:0.2f}%)", value_style="bold white")
                             _kv_line("BEST_IDX", idx0_txt)

@@ -7,9 +7,6 @@ from typing import Callable, Any
 import fitz  # PyMuPDF
 
 from pdfcatch.core.model import EngineOptions, MetricScores, PageResult, TemplateHit, TemplateRef
-from Modules.detector.image.dhash import page_dhash, dhash_score
-from Modules.detector.stream.contents import fingerprint_page_contents, open_pdf as open_pikepdf, stream_similarity
-from Modules.detector.text.metrics import score_text
 
 
 def _final_score(
