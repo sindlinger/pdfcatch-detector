@@ -9,10 +9,12 @@ description = "Offline PDF document detection by similarity (bytes/tlsh/stream/t
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "fastapi>=0.115.0",
   "pymupdf>=1.23.0",
   "pikepdf>=9.0.0",
   "python-dotenv>=1.0.0",
   "rich>=13.0.0",
+  "uvicorn>=0.30.0",
 ]
 
 [project.optional-dependencies]
@@ -24,8 +26,8 @@ prefilter = [
 ]
 
 [project.scripts]
-cli = "pdfcatch.cli:main"
-pdfcatch-detector = "pdfcatch.cli:main"
+pdfcatch-api = "pdfcatch.api_server:main"
+pdfcatch-detector = "pdfcatch.api_server:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

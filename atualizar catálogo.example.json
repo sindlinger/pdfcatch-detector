@@ -1,9 +1,0 @@
-{
-  "tag": "despacho",
-  "autorizar_atualizacao": true,
-  "motivo": "descreva aqui o motivo da atualização controlada",
-  "resultados_relacionados": [
-    "io/out/inferencia_quarentena_tag_despacho_20260304_095434_oficial/inference_summary.json"
-  ],
-  "observacoes": "campos extras são preservados na trilha de auditoria"
-}
